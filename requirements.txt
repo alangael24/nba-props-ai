@@ -1,0 +1,27 @@
+# Datos NBA
+nba_api
+
+# Base de datos
+sqlalchemy
+
+# ML y análisis (sin versiones fijas para Windows)
+pandas
+numpy
+xgboost
+scikit-learn
+scipy
+joblib
+
+# Claude API
+anthropic
+
+# Utilidades
+requests
+tqdm
+python-dotenv
+
+# HTTP client
+httpx
+
+# Telegram (opcional)
+python-telegram-bot

@@ -1422,7 +1422,8 @@ class NBAPropsPredictor:
 
     def calculate_probability_from_quantiles(self, p15: float, p50: float,
                                               p85: float, line: float,
-                                              calibrate: bool = True) -> float:
+                                              calibrate: bool = True,
+                                              stat=None) -> float:
         """
         Calcula probabilidad de Over usando cuantiles en lugar de distribución normal.
 
@@ -1457,10 +1458,17 @@ class NBAPropsPredictor:
             raw_prob = 0.50 - (ratio * 0.35)  # 50% -> 15%
 
         # Aplicar calibración isotónica si está disponible
-        if calibrate and self.probability_calibrator.is_fitted:
-            return self.probability_calibrator.calibrate(raw_prob)
+        prob = raw_prob
 
-        return raw_prob
+        # NOTE: el calibrador actual se entrena con PTS; no lo aplicamos a REB/AST.
+        if calibrate and (stat in (None, "pts")) and self.probability_calibrator.is_fitted:
+            prob = self.probability_calibrator.calibrate(prob)
+
+        if prob is None or not np.isfinite(prob):
+            prob = raw_prob
+
+        # Safety: nunca devolver 0%/100% (evita EV infinito y sobreconfianza)
+        return float(np.clip(prob, 0.05, 0.95))
 
     def get_calibrated_probability(self, raw_prob: float) -> float:
         """
@@ -1511,7 +1519,7 @@ class NBAPropsPredictor:
             p15 = p50 * 0.7
             p85 = p50 * 1.3
 
-        prob_over = self.calculate_probability_from_quantiles(p15, p50, p85, line)
+        prob_over = self.calculate_probability_from_quantiles(p15, p50, p85, line, stat=stat)
 
         prob_under = 1 - prob_over
 

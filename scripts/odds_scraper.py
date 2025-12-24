@@ -45,6 +45,106 @@ ODDS_API_BASE = "https://api.the-odds-api.com/v4"
 # Cache global de spreads por partido
 GAME_SPREADS_CACHE: dict = {}  # (home_team, away_team) -> spread
 
+# ============================================================
+# SAFETY FILTERS - Basado en análisis de 50% win rate
+# ============================================================
+# Problema: Modelo dio 100% confianza en jugadores que fallaron
+# Causa: No detecta cambios de rol (titular hoy por lesión)
+# Solución: Caps de probabilidad + warnings de Value Trap
+
+PROB_CAP_HIGH = 0.80              # Nunca mostrar > 80% (siempre hay varianza)
+PROB_CAP_LOW = 0.20               # Nunca mostrar < 20%
+VALUE_TRAP_EDGE_THRESHOLD = 40.0  # UNDER con edge > 40% = probable trampa
+BLOWOUT_SPREAD_THRESHOLD = 10.0   # OVER con spread > 10 = evitar
+
+
+def apply_probability_cap(prob: float) -> float:
+    """
+    Cap probabilidad para prevenir sobreconfianza.
+    Nunca mostrar > 80% o < 20% - siempre existe varianza.
+    """
+    return max(PROB_CAP_LOW, min(PROB_CAP_HIGH, prob))
+
+
+def detect_value_trap(bet_type: str, edge: float, line: float, prediction: float) -> tuple:
+    """
+    Detecta "Value Trap" - cuando el edge parece demasiado bueno.
+
+    Si la casa pone línea MUY ALTA vs nuestra predicción, probablemente
+    saben algo que no sabemos (ej: jugador será titular hoy).
+
+    Returns: (is_trap, warning_message)
+    """
+    if bet_type == "UNDER" and edge > VALUE_TRAP_EDGE_THRESHOLD:
+        line_vs_pred_ratio = line / prediction if prediction > 0 else 999
+        if line_vs_pred_ratio > 1.5:  # Línea es 50%+ mayor que predicción
+            return (True,
+                f"🚨 VALUE TRAP: Línea ({line}) muy alta vs predicción ({prediction:.1f}). "
+                f"La casa probablemente sabe que será titular hoy. VERIFICAR NOTICIAS.")
+        else:
+            return (True,
+                f"⚠️ EDGE SOSPECHOSO: +{edge:.0f}% es muy alto. Verificar lesiones/lineups.")
+    return (False, "")
+
+
+def detect_blowout_over_risk(bet_type: str, spread: float) -> tuple:
+    """
+    Detecta riesgo de blowout para apuestas OVER.
+
+    En blowouts, los titulares se sientan el último cuarto = menos stats.
+
+    Returns: (is_risky, warning_message)
+    """
+    if bet_type == "OVER" and abs(spread) > BLOWOUT_SPREAD_THRESHOLD:
+        return (True,
+            f"🛑 BLOWOUT WARNING: Spread {spread:+.1f} pts. "
+            f"En blowouts los titulares descansan - EVITAR OVER.")
+    return (False, "")
+
+
+# Cache para equipos de jugadores
+_PLAYER_TEAM_CACHE: dict = {}
+
+def get_player_team(player_name: str) -> Optional[str]:
+    """
+    Obtiene el equipo actual de un jugador desde la DB.
+    Retorna la abreviatura del equipo (ej: 'LAL', 'BOS').
+    """
+    global _PLAYER_TEAM_CACHE
+
+    if player_name in _PLAYER_TEAM_CACHE:
+        return _PLAYER_TEAM_CACHE[player_name]
+
+    db_path = Path(__file__).parent.parent / "data" / "nba_props.db"
+    if not db_path.exists():
+        return None
+
+    try:
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+
+        # Buscar el equipo más reciente del jugador en game_logs
+        cursor.execute("""
+            SELECT matchup FROM player_game_logs
+            WHERE player_name = ?
+            ORDER BY game_date DESC
+            LIMIT 1
+        """, (player_name,))
+
+        row = cursor.fetchone()
+        conn.close()
+
+        if row and row[0]:
+            # matchup format: "LAL vs. GSW" or "LAL @ GSW"
+            matchup = row[0]
+            team_abbrev = matchup.split()[0]  # First part is always the player's team
+            _PLAYER_TEAM_CACHE[player_name] = team_abbrev
+            return team_abbrev
+
+        return None
+    except Exception:
+        return None
+
 
 def fetch_game_spreads() -> dict:
     """
@@ -293,10 +393,11 @@ def fetch_real_odds_from_api() -> list:
                                             # Obtener spread del partido
                                             game_spread = spreads.get((home_team, away_team), 0.0)
 
+                                            # Guardar ambos equipos para determinar is_home después
                                             all_props.append({
                                                 "player": player,
-                                                "team": home_abbrev if player else away_abbrev,
-                                                "opponent": away_abbrev,
+                                                "home_abbrev": home_abbrev,
+                                                "away_abbrev": away_abbrev,
                                                 "home_team": home_team,
                                                 "away_team": away_team,
                                                 "stat": stat,
@@ -721,11 +822,35 @@ def scan_for_value():
         props = []
         seen_players = set()
 
+        # Inicializar name matcher para resolver nombres y obtener equipos
+        name_matcher = get_matcher() if NAME_MATCHER_AVAILABLE else None
+
         for rp in real_props:
-            player = rp["player"]
+            player_raw = rp["player"]
             game_spread = rp.get("game_spread", 0.0)
             home_team = rp.get("home_team", "")
             away_team = rp.get("away_team", "")
+            home_abbrev = rp.get("home_abbrev", "")
+            away_abbrev = rp.get("away_abbrev", "")
+
+            # Resolver nombre del jugador
+            if name_matcher:
+                resolved = name_matcher.resolve(player_raw)
+                player = resolved[0] if resolved else player_raw
+            else:
+                player = player_raw
+
+            # Determinar el equipo real del jugador desde la DB
+            player_team = get_player_team(player)
+
+            # Determinar is_home y opponent basado en el equipo del jugador
+            if player_team:
+                is_home = (player_team == home_abbrev)
+                opponent = away_abbrev if is_home else home_abbrev
+            else:
+                # Fallback: asumir away si no encontramos el equipo
+                is_home = False
+                opponent = home_abbrev if home_abbrev else away_abbrev
 
             if player in seen_players:
                 # Ya existe, agregar stat
@@ -741,12 +866,15 @@ def scan_for_value():
                 seen_players.add(player)
                 props.append({
                     "player": player,
-                    "opponent": rp["opponent"],
-                    "is_home": True,  # TODO: determinar correctamente
+                    "player_team": player_team,
+                    "opponent": opponent,
+                    "is_home": is_home,
                     "source": rp.get("source", "API"),
                     "game_spread": game_spread,
                     "home_team": home_team,
                     "away_team": away_team,
+                    "home_abbrev": home_abbrev,
+                    "away_abbrev": away_abbrev,
                     "props": {
                         rp["stat"]: {
                             "line": rp["line"],
@@ -809,7 +937,10 @@ def scan_for_value():
             if abs(game_spread) >= 8:
                 spread_info = f" [Spread: {game_spread:+.1f}, Blowout Risk: {(1-blowout_factor)*100:.0f}%]"
 
-            print(f"\nAnalizando: {player} vs {opponent}{source_tag}{spread_info}")
+            # Mostrar Home/Away para verificar que funciona
+            home_away_tag = "🏠" if is_home else "✈️"
+            player_team = prop.get("player_team", "?")
+            print(f"\nAnalizando: {player} ({player_team}) {home_away_tag} vs {opponent}{source_tag}{spread_info}")
 
             try:
                 result = predictor.predict_player(player, opponent, is_home=is_home)
@@ -848,15 +979,20 @@ def scan_for_value():
                         p50 = result["predictions_ast"]["p50_median"]
                         p85 = result["predictions_ast"]["p85_ceiling"]
 
-                    prob_over = predictor.calculate_probability_from_quantiles(
-                        p15, p50, p85, line
+                    prob_over_raw = predictor.calculate_probability_from_quantiles(
+                        p15, p50, p85, line, stat=stat
                     )
+
+                    # SAFETY: Apply probability cap (nunca 100% o 0%)
+                    prob_over = apply_probability_cap(prob_over_raw)
 
                     predictions[player][stat] = {
                         "prediction": pred_value,
                         "prob_over": prob_over,
+                        "prob_over_raw": prob_over_raw,  # Para debug
                         "p15": p15,
                         "p85": p85,
+                        "line": line,  # Guardar para Value Trap detection
                         "blowout_factor": blowout_factor,
                         "game_spread": game_spread
                     }
@@ -903,26 +1039,60 @@ def scan_for_value():
     if not value_bets:
         print("\nNo se encontraron apuestas con EV > 3%")
     else:
-        for i, bet in enumerate(value_bets[:10], 1):
-            pred = f"{bet['model_prediction']:.1f}" if bet['model_prediction'] else "N/A"
-            prob = f"{bet['model_probability']:.1f}"
-            edge = f"{bet['edge']:.1f}"
-            ev = f"{bet['ev']:.1f}"
+        # Leyenda de alertas
+        print(f"\n{'─'*60}")
+        print("📋 LEYENDA:")
+        print("   ✅ = Apuesta segura (sin alertas)")
+        print("   🚨 = VALUE TRAP - Verificar noticias antes de apostar")
+        print("   🛑 = BLOWOUT RISK - Evitar OVER en este partido")
+        print(f"{'─'*60}")
 
-            # Verificar riesgo de blowout desde predictions
+        for i, bet in enumerate(value_bets[:10], 1):
+            pred = bet['model_prediction']
+            pred_str = f"{pred:.1f}" if pred else "N/A"
+            prob = bet['model_probability']
+            edge = bet['edge']
+            ev = bet['ev']
+            bet_type = bet['bet_type']
+            line = bet['line']
+
             player = bet['player']
             stat = bet['stat']
-            blowout_warning = ""
-            if player in predictions and stat in predictions[player]:
-                blowout_factor = predictions[player][stat].get("blowout_factor", 1.0)
-                game_spread = predictions[player][stat].get("game_spread", 0.0)
-                if blowout_factor < 0.92:
-                    blowout_warning = f" ⚠️ BLOWOUT RISK (spread: {game_spread:+.1f})"
+            warnings = []
 
-            print(f"\n#{i} {bet['player']} - {bet['stat'].upper()} {bet['bet_type']}{blowout_warning}")
-            print(f"   Línea: {bet['line']} @ {bet['odds']}")
-            print(f"   Predicción: {pred} | Prob: {prob}%")
-            print(f"   Edge: +{edge}% | EV: +{ev}%")
+            if player in predictions and stat in predictions[player]:
+                pred_data = predictions[player][stat]
+                game_spread = pred_data.get("game_spread", 0.0)
+                prediction = pred_data.get("prediction", 0)
+
+                # FILTRO 1: Detectar Value Trap (UNDER con edge muy alto)
+                is_trap, trap_msg = detect_value_trap(bet_type, edge, line, prediction)
+                if is_trap:
+                    warnings.append(trap_msg)
+
+                # FILTRO 2: Detectar Blowout Risk para OVER
+                is_blowout, blowout_msg = detect_blowout_over_risk(bet_type, game_spread)
+                if is_blowout:
+                    warnings.append(blowout_msg)
+
+            # Determinar icono de seguridad
+            if any("🚨" in w for w in warnings):
+                safety_icon = "🚨"
+            elif any("🛑" in w for w in warnings):
+                safety_icon = "🛑"
+            elif warnings:
+                safety_icon = "⚠️"
+            else:
+                safety_icon = "✅"
+
+            print(f"\n{safety_icon} #{i} {player} - {stat.upper()} {bet_type}")
+            print(f"   Línea: {line} @ {bet['odds']}")
+            print(f"   Predicción: {pred_str} | Prob: {prob:.1f}%")
+            print(f"   Edge: +{edge:.1f}% | EV: +{ev:.1f}%")
+
+            # Mostrar warnings
+            for warning in warnings:
+                print(f"   {warning}")
 
     return value_bets
 

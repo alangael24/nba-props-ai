@@ -48,12 +48,21 @@ class NBAPropsPredictor:
         self.model_ppm_p50 = None
         self.model_ppm_p85 = None
 
-        # Modelos RPM y APM (mediana solamente para simplicidad)
-        self.model_rpm = None
-        self.model_apm = None
+        # Modelos RPM (con cuantiles)
+        self.model_rpm_p15 = None
+        self.model_rpm_p50 = None
+        self.model_rpm_p85 = None
+
+        # Modelos APM (con cuantiles)
+        self.model_apm_p15 = None
+        self.model_apm_p50 = None
+        self.model_apm_p85 = None
 
         self.minutes_features = None
         self.efficiency_features = None
+
+        # Calibración de probabilidades
+        self.calibration_curve = None
 
         # Cuantiles que usamos
         self.quantiles = [0.15, 0.50, 0.85]
@@ -247,6 +256,72 @@ class NBAPropsPredictor:
         model.fit(X_train, y_train)
         return model
 
+    def _calibrate_probabilities(self, actual: np.ndarray, pred_p15: np.ndarray,
+                                  pred_p50: np.ndarray, pred_p85: np.ndarray) -> dict:
+        """
+        Calibra probabilidades empíricas basadas en datos históricos.
+
+        Para cada "posición de línea" relativa a los cuantiles,
+        calcula el % real de Over observado.
+        """
+        calibration = {
+            "below_p15": {"count": 0, "over_rate": 0.0},
+            "p15_to_p50": {"count": 0, "over_rate": 0.0},
+            "p50_to_p85": {"count": 0, "over_rate": 0.0},
+            "above_p85": {"count": 0, "over_rate": 0.0},
+        }
+
+        n = len(actual)
+
+        for i in range(n):
+            # Usamos P50 como "línea" hipotética para calibración
+            line = pred_p50[i]
+
+            if line < pred_p15[i]:
+                bucket = "below_p15"
+            elif line < pred_p50[i]:
+                bucket = "p15_to_p50"
+            elif line < pred_p85[i]:
+                bucket = "p50_to_p85"
+            else:
+                bucket = "above_p85"
+
+            calibration[bucket]["count"] += 1
+            if actual[i] > line:
+                calibration[bucket]["over_rate"] += 1
+
+        # Calcular tasas
+        for bucket in calibration:
+            if calibration[bucket]["count"] > 0:
+                calibration[bucket]["over_rate"] /= calibration[bucket]["count"]
+
+        # Calibración más detallada: bins de diferencia (actual - pred) / pred
+        # Crear 10 bins para interpolación isotónica
+        diffs = (actual - pred_p50) / np.maximum(pred_p50, 1)
+        bins = np.percentile(diffs, np.arange(0, 101, 10))
+
+        detailed_calibration = []
+        for i in range(len(bins) - 1):
+            mask = (diffs >= bins[i]) & (diffs < bins[i + 1])
+            if mask.sum() > 0:
+                # Para cada bin, ¿qué % superó P50?
+                over_rate = (actual[mask] > pred_p50[mask]).mean()
+                detailed_calibration.append({
+                    "diff_pct_low": bins[i],
+                    "diff_pct_high": bins[i + 1],
+                    "empirical_over_rate": over_rate,
+                    "count": mask.sum()
+                })
+
+        print(f"Calibración por bucket:")
+        for bucket, data in calibration.items():
+            print(f"  {bucket}: {data['over_rate']*100:.1f}% over (n={data['count']})")
+
+        return {
+            "buckets": calibration,
+            "detailed": detailed_calibration
+        }
+
     def train(self, test_size: float = 0.2):
         """
         Entrena modelos con REGRESIÓN DE CUANTILES.
@@ -255,6 +330,9 @@ class NBAPropsPredictor:
         - P15: El piso (mal día)
         - P50: La mediana (día normal)
         - P85: El techo (buen día)
+
+        IMPORTANTE: Split TEMPORAL por fecha, no por índice.
+        Después de evaluar, re-entrena con TODO el dataset.
         """
         print("="*60)
         print("ENTRENAMIENTO: Minutos × Eficiencia + CUANTILES")
@@ -280,7 +358,14 @@ class NBAPropsPredictor:
             print("ERROR: No hay suficientes datos.")
             return
 
-        split_idx = int(len(features_df) * (1 - test_size))
+        # === SPLIT TEMPORAL POR FECHA (no por índice) ===
+        features_df = features_df.sort_values("game_date").reset_index(drop=True)
+        cutoff_date = features_df["game_date"].quantile(1 - test_size)
+        train_mask = features_df["game_date"] < cutoff_date
+        test_mask = features_df["game_date"] >= cutoff_date
+
+        print(f"Split temporal: train < {cutoff_date.strftime('%Y-%m-%d')}, test >= {cutoff_date.strftime('%Y-%m-%d')}")
+        print(f"Train: {train_mask.sum()} | Test: {test_mask.sum()}")
 
         self.minutes_features = self.get_minutes_features()
         self.efficiency_features = self.get_efficiency_features()
@@ -295,10 +380,10 @@ class NBAPropsPredictor:
         X_min = features_df[self.minutes_features].fillna(0)
         y_min = features_df["actual_min"]
 
-        X_min_train = X_min.iloc[:split_idx]
-        X_min_test = X_min.iloc[split_idx:]
-        y_min_train = y_min.iloc[:split_idx]
-        y_min_test = y_min.iloc[split_idx:]
+        X_min_train = X_min[train_mask]
+        X_min_test = X_min[test_mask]
+        y_min_train = y_min[train_mask]
+        y_min_test = y_min[test_mask]
 
         # Entrenar cuantiles para minutos
         print("Entrenando P15 (piso)...")
@@ -339,10 +424,10 @@ class NBAPropsPredictor:
         X_ppm = features_df[ppm_features].fillna(0)
         y_ppm = features_df["actual_ppm"]
 
-        X_ppm_train = X_ppm.iloc[:split_idx]
-        y_ppm_train = y_ppm.iloc[:split_idx]
-        X_ppm_test = X_ppm.iloc[split_idx:]
-        y_ppm_test = y_ppm.iloc[split_idx:]
+        X_ppm_train = X_ppm[train_mask]
+        y_ppm_train = y_ppm[train_mask]
+        X_ppm_test = X_ppm[test_mask]
+        y_ppm_test = y_ppm[test_mask]
 
         print("Entrenando PPM cuantiles...")
         self.model_ppm_p15 = self._train_quantile_model(X_ppm_train, y_ppm_train, 0.15, max_depth=4)
@@ -354,10 +439,10 @@ class NBAPropsPredictor:
         print(f"MAE PPM (mediana): {mae_ppm:.3f}")
 
         # ============================================================
-        # MODELOS RPM y APM (solo mediana por simplicidad)
+        # MODELOS RPM y APM (con cuantiles P15/P50/P85)
         # ============================================================
         print("\n" + "="*50)
-        print("MODELOS RPM y APM (mediana)")
+        print("MODELOS RPM y APM (Cuantiles)")
         print("="*50)
 
         rpm_features = [
@@ -367,12 +452,19 @@ class NBAPropsPredictor:
         X_rpm = features_df[rpm_features].fillna(0)
         y_rpm = features_df["actual_rpm"]
 
-        self.model_rpm = self._train_quantile_model(
-            X_rpm.iloc[:split_idx], y_rpm.iloc[:split_idx], 0.50, max_depth=4
-        )
-        pred_rpm = self.model_rpm.predict(X_rpm.iloc[split_idx:])
-        mae_rpm = mean_absolute_error(y_rpm.iloc[split_idx:], pred_rpm)
-        print(f"MAE RPM: {mae_rpm:.3f}")
+        X_rpm_train = X_rpm[train_mask]
+        X_rpm_test = X_rpm[test_mask]
+        y_rpm_train = y_rpm[train_mask]
+        y_rpm_test = y_rpm[test_mask]
+
+        print("Entrenando RPM cuantiles...")
+        self.model_rpm_p15 = self._train_quantile_model(X_rpm_train, y_rpm_train, 0.15, max_depth=4)
+        self.model_rpm_p50 = self._train_quantile_model(X_rpm_train, y_rpm_train, 0.50, max_depth=4)
+        self.model_rpm_p85 = self._train_quantile_model(X_rpm_train, y_rpm_train, 0.85, max_depth=4)
+
+        pred_rpm_p50 = self.model_rpm_p50.predict(X_rpm_test)
+        mae_rpm = mean_absolute_error(y_rpm_test, pred_rpm_p50)
+        print(f"MAE RPM (mediana): {mae_rpm:.3f}")
 
         apm_features = [
             "avg_apm_5", "avg_apm_10", "season_avg_apm", "std_apm",
@@ -381,12 +473,19 @@ class NBAPropsPredictor:
         X_apm = features_df[apm_features].fillna(0)
         y_apm = features_df["actual_apm"]
 
-        self.model_apm = self._train_quantile_model(
-            X_apm.iloc[:split_idx], y_apm.iloc[:split_idx], 0.50, max_depth=4
-        )
-        pred_apm = self.model_apm.predict(X_apm.iloc[split_idx:])
-        mae_apm = mean_absolute_error(y_apm.iloc[split_idx:], pred_apm)
-        print(f"MAE APM: {mae_apm:.3f}")
+        X_apm_train = X_apm[train_mask]
+        X_apm_test = X_apm[test_mask]
+        y_apm_train = y_apm[train_mask]
+        y_apm_test = y_apm[test_mask]
+
+        print("Entrenando APM cuantiles...")
+        self.model_apm_p15 = self._train_quantile_model(X_apm_train, y_apm_train, 0.15, max_depth=4)
+        self.model_apm_p50 = self._train_quantile_model(X_apm_train, y_apm_train, 0.50, max_depth=4)
+        self.model_apm_p85 = self._train_quantile_model(X_apm_train, y_apm_train, 0.85, max_depth=4)
+
+        pred_apm_p50 = self.model_apm_p50.predict(X_apm_test)
+        mae_apm = mean_absolute_error(y_apm_test, pred_apm_p50)
+        print(f"MAE APM (mediana): {mae_apm:.3f}")
 
         # ============================================================
         # VALIDACIÓN: Predicción Combinada con Cuantiles
@@ -406,7 +505,7 @@ class NBAPropsPredictor:
         pred_ppm_p85 = self.model_ppm_p85.predict(X_ppm_test)
         final_pred_pts_p85 = pred_min_p85 * pred_ppm_p85
 
-        actual_pts = features_df["actual_pts"].iloc[split_idx:]
+        actual_pts = features_df["actual_pts"][test_mask]
 
         mae_pts = mean_absolute_error(actual_pts, final_pred_pts_p50)
         print(f"MAE Puntos (mediana): {mae_pts:.2f}")
@@ -417,16 +516,83 @@ class NBAPropsPredictor:
         print(f"Puntos > P15: {pts_above_p15*100:.1f}% (esperado ~85%)")
         print(f"Puntos < P85: {pts_below_p85*100:.1f}% (esperado ~85%)")
 
+        # Validación REB/AST con cuantiles
+        pred_rpm_p15 = self.model_rpm_p15.predict(X_rpm_test)
+        pred_rpm_p85 = self.model_rpm_p85.predict(X_rpm_test)
+        pred_apm_p15 = self.model_apm_p15.predict(X_apm_test)
+        pred_apm_p85 = self.model_apm_p85.predict(X_apm_test)
+
+        final_pred_reb_p15 = pred_min_p15 * pred_rpm_p15
+        final_pred_reb_p50 = pred_min_p50 * pred_rpm_p50
+        final_pred_reb_p85 = pred_min_p85 * pred_rpm_p85
+
+        final_pred_ast_p15 = pred_min_p15 * pred_apm_p15
+        final_pred_ast_p50 = pred_min_p50 * pred_apm_p50
+        final_pred_ast_p85 = pred_min_p85 * pred_apm_p85
+
+        actual_reb = features_df["actual_reb"][test_mask]
+        actual_ast = features_df["actual_ast"][test_mask]
+
+        mae_reb = mean_absolute_error(actual_reb, final_pred_reb_p50)
+        mae_ast = mean_absolute_error(actual_ast, final_pred_ast_p50)
+        print(f"MAE Rebotes (mediana): {mae_reb:.2f}")
+        print(f"MAE Asistencias (mediana): {mae_ast:.2f}")
+
         # Ejemplo de rango
-        print(f"\nEjemplo de predicción con rango:")
-        print(f"  P15 (piso):    {final_pred_pts_p15.mean():.1f} pts")
-        print(f"  P50 (mediana): {final_pred_pts_p50.mean():.1f} pts")
-        print(f"  P85 (techo):   {final_pred_pts_p85.mean():.1f} pts")
+        print(f"\nEjemplo de predicción con rango (promedio test set):")
+        print(f"  PTS: {final_pred_pts_p15.mean():.1f} - {final_pred_pts_p50.mean():.1f} - {final_pred_pts_p85.mean():.1f}")
+        print(f"  REB: {final_pred_reb_p15.mean():.1f} - {final_pred_reb_p50.mean():.1f} - {final_pred_reb_p85.mean():.1f}")
+        print(f"  AST: {final_pred_ast_p15.mean():.1f} - {final_pred_ast_p50.mean():.1f} - {final_pred_ast_p85.mean():.1f}")
 
         # ============================================================
-        # GUARDAR MODELOS
+        # CALIBRACIÓN DE PROBABILIDADES (guardar para uso posterior)
         # ============================================================
-        print("\nGuardando modelos...")
+        print("\n" + "="*50)
+        print("CALIBRACIÓN DE PROBABILIDADES")
+        print("="*50)
+
+        # Calcular calibración empírica: para cada rango de predicción,
+        # ¿qué porcentaje realmente supera la línea?
+        calibration_data = self._calibrate_probabilities(
+            actual_pts.values, final_pred_pts_p15, final_pred_pts_p50, final_pred_pts_p85
+        )
+        self.calibration_curve = calibration_data
+
+        # ============================================================
+        # RE-ENTRENAR CON TODOS LOS DATOS PARA PRODUCCIÓN
+        # ============================================================
+        print("\n" + "="*50)
+        print("RE-ENTRENANDO CON TODOS LOS DATOS PARA PRODUCCIÓN")
+        print("="*50)
+
+        # Minutos - todo el dataset
+        print("Re-entrenando modelos de minutos...")
+        self.model_minutes_p15 = self._train_quantile_model(X_min, y_min, 0.15)
+        self.model_minutes_p50 = self._train_quantile_model(X_min, y_min, 0.50)
+        self.model_minutes_p85 = self._train_quantile_model(X_min, y_min, 0.85)
+
+        # PPM - todo el dataset
+        print("Re-entrenando modelos de PPM...")
+        self.model_ppm_p15 = self._train_quantile_model(X_ppm, y_ppm, 0.15, max_depth=4)
+        self.model_ppm_p50 = self._train_quantile_model(X_ppm, y_ppm, 0.50, max_depth=4)
+        self.model_ppm_p85 = self._train_quantile_model(X_ppm, y_ppm, 0.85, max_depth=4)
+
+        # RPM - todo el dataset
+        print("Re-entrenando modelos de RPM...")
+        self.model_rpm_p15 = self._train_quantile_model(X_rpm, y_rpm, 0.15, max_depth=4)
+        self.model_rpm_p50 = self._train_quantile_model(X_rpm, y_rpm, 0.50, max_depth=4)
+        self.model_rpm_p85 = self._train_quantile_model(X_rpm, y_rpm, 0.85, max_depth=4)
+
+        # APM - todo el dataset
+        print("Re-entrenando modelos de APM...")
+        self.model_apm_p15 = self._train_quantile_model(X_apm, y_apm, 0.15, max_depth=4)
+        self.model_apm_p50 = self._train_quantile_model(X_apm, y_apm, 0.50, max_depth=4)
+        self.model_apm_p85 = self._train_quantile_model(X_apm, y_apm, 0.85, max_depth=4)
+
+        # ============================================================
+        # GUARDAR MODELOS (entrenados con TODO el dataset)
+        # ============================================================
+        print("\nGuardando modelos (entrenados con todos los datos)...")
 
         # Minutos (cuantiles)
         joblib.dump(self.model_minutes_p15, MODELS_PATH / "model_minutes_p15.joblib")
@@ -438,11 +604,18 @@ class NBAPropsPredictor:
         joblib.dump(self.model_ppm_p50, MODELS_PATH / "model_ppm_p50.joblib")
         joblib.dump(self.model_ppm_p85, MODELS_PATH / "model_ppm_p85.joblib")
 
-        # RPM y APM
-        joblib.dump(self.model_rpm, MODELS_PATH / "model_rpm.joblib")
-        joblib.dump(self.model_apm, MODELS_PATH / "model_apm.joblib")
+        # RPM (cuantiles)
+        joblib.dump(self.model_rpm_p15, MODELS_PATH / "model_rpm_p15.joblib")
+        joblib.dump(self.model_rpm_p50, MODELS_PATH / "model_rpm_p50.joblib")
+        joblib.dump(self.model_rpm_p85, MODELS_PATH / "model_rpm_p85.joblib")
 
-        # Features
+        # APM (cuantiles)
+        joblib.dump(self.model_apm_p15, MODELS_PATH / "model_apm_p15.joblib")
+        joblib.dump(self.model_apm_p50, MODELS_PATH / "model_apm_p50.joblib")
+        joblib.dump(self.model_apm_p85, MODELS_PATH / "model_apm_p85.joblib")
+
+        # Calibración y features
+        joblib.dump(self.calibration_curve, MODELS_PATH / "calibration_curve.joblib")
         joblib.dump(self.minutes_features, MODELS_PATH / "minutes_features.joblib")
 
         print("Modelos guardados correctamente.")
@@ -459,29 +632,43 @@ class NBAPropsPredictor:
         self.model_ppm_p50 = joblib.load(MODELS_PATH / "model_ppm_p50.joblib")
         self.model_ppm_p85 = joblib.load(MODELS_PATH / "model_ppm_p85.joblib")
 
-        # RPM y APM
-        self.model_rpm = joblib.load(MODELS_PATH / "model_rpm.joblib")
-        self.model_apm = joblib.load(MODELS_PATH / "model_apm.joblib")
+        # RPM (cuantiles)
+        self.model_rpm_p15 = joblib.load(MODELS_PATH / "model_rpm_p15.joblib")
+        self.model_rpm_p50 = joblib.load(MODELS_PATH / "model_rpm_p50.joblib")
+        self.model_rpm_p85 = joblib.load(MODELS_PATH / "model_rpm_p85.joblib")
 
-        # Features
+        # APM (cuantiles)
+        self.model_apm_p15 = joblib.load(MODELS_PATH / "model_apm_p15.joblib")
+        self.model_apm_p50 = joblib.load(MODELS_PATH / "model_apm_p50.joblib")
+        self.model_apm_p85 = joblib.load(MODELS_PATH / "model_apm_p85.joblib")
+
+        # Calibración y features
+        try:
+            self.calibration_curve = joblib.load(MODELS_PATH / "calibration_curve.joblib")
+        except FileNotFoundError:
+            self.calibration_curve = None
         self.minutes_features = joblib.load(MODELS_PATH / "minutes_features.joblib")
 
     def predict_player(self, player_name: str, opponent: str, is_home: bool = True,
-                       days_rest: int = 2, minutes_override: float = None) -> dict:
+                       days_rest: int = None, minutes_override: float = None) -> dict:
         """
         Predice estadísticas usando Minutos × Eficiencia con CUANTILES.
 
-        Retorna P15 (piso), P50 (mediana), P85 (techo) para puntos.
+        Retorna P15 (piso), P50 (mediana), P85 (techo) para puntos, rebotes, asistencias.
+
+        Args:
+            days_rest: Si es None, se calcula automáticamente de los datos.
         """
         if self.model_minutes_p50 is None:
             self.load_models()
 
         conn = sqlite3.connect(DB_PATH)
+        # LIMIT 82 = temporada completa (alineado con entrenamiento)
         player_df = pd.read_sql("""
             SELECT * FROM player_game_logs
             WHERE player_name = ?
             ORDER BY game_date DESC
-            LIMIT 30
+            LIMIT 82
         """, conn, params=[player_name])
         conn.close()
 
@@ -492,6 +679,18 @@ class NBAPropsPredictor:
         player_df["ppm"] = player_df["pts"] / player_df["min"].replace(0, 1)
         player_df["rpm"] = player_df["reb"] / player_df["min"].replace(0, 1)
         player_df["apm"] = player_df["ast"] / player_df["min"].replace(0, 1)
+
+        # Calcular days_rest desde fechas reales si no se proporciona
+        if days_rest is None:
+            player_df["game_date"] = pd.to_datetime(player_df["game_date"])
+            if len(player_df) >= 2:
+                # Días entre el partido más reciente y el anterior
+                most_recent = player_df["game_date"].iloc[0]
+                second_recent = player_df["game_date"].iloc[1]
+                days_rest = (most_recent - second_recent).days
+                days_rest = max(1, min(days_rest, 7))  # Clamp entre 1 y 7
+            else:
+                days_rest = 2  # Default
 
         last_5 = player_df.head(5)
         last_10 = player_df.head(10)
@@ -567,25 +766,38 @@ class NBAPropsPredictor:
         pred_ppm_p50 = self.model_ppm_p50.predict(X_ppm)[0]
         pred_ppm_p85 = self.model_ppm_p85.predict(X_ppm)[0]
 
-        # RPM y APM (solo mediana)
-        pred_rpm = self.model_rpm.predict(X_rpm)[0]
-        pred_apm = self.model_apm.predict(X_apm)[0]
+        # RPM (con cuantiles)
+        pred_rpm_p15 = self.model_rpm_p15.predict(X_rpm)[0]
+        pred_rpm_p50 = self.model_rpm_p50.predict(X_rpm)[0]
+        pred_rpm_p85 = self.model_rpm_p85.predict(X_rpm)[0]
+
+        # APM (con cuantiles)
+        pred_apm_p15 = self.model_apm_p15.predict(X_apm)[0]
+        pred_apm_p50 = self.model_apm_p50.predict(X_apm)[0]
+        pred_apm_p85 = self.model_apm_p85.predict(X_apm)[0]
 
         # === PREDICCIÓN FINAL CON CUANTILES ===
-        # P15 = min bajo × ppm bajo (mal día)
+        # P15 = min bajo × eficiencia baja (mal día)
+        # P50 = min mediana × eficiencia mediana (día normal)
+        # P85 = min alto × eficiencia alta (buen día)
+
         pred_pts_p15 = pred_min_p15 * pred_ppm_p15
-        # P50 = min mediana × ppm mediana (día normal)
         pred_pts_p50 = pred_min_p50 * pred_ppm_p50
-        # P85 = min alto × ppm alto (buen día)
         pred_pts_p85 = pred_min_p85 * pred_ppm_p85
 
-        pred_reb = pred_min_p50 * pred_rpm
-        pred_ast = pred_min_p50 * pred_apm
+        pred_reb_p15 = pred_min_p15 * pred_rpm_p15
+        pred_reb_p50 = pred_min_p50 * pred_rpm_p50
+        pred_reb_p85 = pred_min_p85 * pred_rpm_p85
+
+        pred_ast_p15 = pred_min_p15 * pred_apm_p15
+        pred_ast_p50 = pred_min_p50 * pred_apm_p50
+        pred_ast_p85 = pred_min_p85 * pred_apm_p85
 
         return {
             "player": player_name,
             "opponent": opponent,
             "is_home": is_home,
+            "days_rest": days_rest,
             "model_type": "QUANTILE REGRESSION",
             "minutes": {
                 "p15_floor": round(pred_min_p15, 1),
@@ -605,10 +817,22 @@ class NBAPropsPredictor:
                 "p85_ceiling": round(pred_pts_p85, 1),
                 "range": f"{round(pred_pts_p15, 1)} - {round(pred_pts_p85, 1)}"
             },
+            "predictions_reb": {
+                "p15_floor": round(pred_reb_p15, 1),
+                "p50_median": round(pred_reb_p50, 1),
+                "p85_ceiling": round(pred_reb_p85, 1),
+                "range": f"{round(pred_reb_p15, 1)} - {round(pred_reb_p85, 1)}"
+            },
+            "predictions_ast": {
+                "p15_floor": round(pred_ast_p15, 1),
+                "p50_median": round(pred_ast_p50, 1),
+                "p85_ceiling": round(pred_ast_p85, 1),
+                "range": f"{round(pred_ast_p15, 1)} - {round(pred_ast_p85, 1)}"
+            },
             "predictions": {
                 "pts": round(pred_pts_p50, 1),  # Mediana como principal
-                "reb": round(pred_reb, 1),
-                "ast": round(pred_ast, 1)
+                "reb": round(pred_reb_p50, 1),
+                "ast": round(pred_ast_p50, 1)
             },
             "formula": {
                 "floor": f"{round(pred_min_p15, 1)} min × {round(pred_ppm_p15, 3)} = {round(pred_pts_p15, 1)} pts",
@@ -664,21 +888,26 @@ class NBAPropsPredictor:
         if "error" in prediction:
             return prediction
 
-        # Solo para puntos usamos cuantiles completos
+        # Usar cuantiles reales para todas las estadísticas
         if stat == "pts":
             p15 = prediction["predictions_pts"]["p15_floor"]
             p50 = prediction["predictions_pts"]["p50_median"]
             p85 = prediction["predictions_pts"]["p85_ceiling"]
-
-            prob_over = self.calculate_probability_from_quantiles(p15, p50, p85, line)
+        elif stat == "reb":
+            p15 = prediction["predictions_reb"]["p15_floor"]
+            p50 = prediction["predictions_reb"]["p50_median"]
+            p85 = prediction["predictions_reb"]["p85_ceiling"]
+        elif stat == "ast":
+            p15 = prediction["predictions_ast"]["p15_floor"]
+            p50 = prediction["predictions_ast"]["p50_median"]
+            p85 = prediction["predictions_ast"]["p85_ceiling"]
         else:
-            # Para reb/ast usamos solo mediana con aproximación
-            p50 = prediction["predictions"][stat]
-            # Aproximación simple para reb/ast
-            prob_over = 0.5 + (p50 - line) * 0.1
-            prob_over = max(0.1, min(0.9, prob_over))
+            # Fallback para stats no soportadas
+            p50 = prediction["predictions"].get(stat, 10)
             p15 = p50 * 0.7
             p85 = p50 * 1.3
+
+        prob_over = self.calculate_probability_from_quantiles(p15, p50, p85, line)
 
         prob_under = 1 - prob_over
 

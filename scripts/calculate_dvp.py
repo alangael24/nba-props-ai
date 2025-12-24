@@ -11,33 +11,79 @@ import numpy as np
 
 DB_PATH = Path(__file__).parent.parent / "data" / "nba_props.db"
 
-# Mapeo de jugadores a posiciones (simplificado)
-# En producción, usar la API para obtener posiciones reales
-POSITION_MAPPING = {
-    # Guards
-    "PG": ["Stephen Curry", "Luka Doncic", "Trae Young", "Ja Morant", "Tyrese Haliburton",
-           "Damian Lillard", "Shai Gilgeous-Alexander", "De'Aaron Fox", "Jalen Brunson"],
-    "SG": ["Devin Booker", "Donovan Mitchell", "Anthony Edwards", "Jaylen Brown",
-           "Zach LaVine", "Bradley Beal", "CJ McCollum", "Desmond Bane"],
-    # Forwards
-    "SF": ["LeBron James", "Kevin Durant", "Jayson Tatum", "Jimmy Butler", "Paul George",
-           "Kawhi Leonard", "Brandon Ingram", "DeMar DeRozan", "Khris Middleton"],
-    "PF": ["Giannis Antetokounmpo", "Lauri Markkanen", "Jaren Jackson Jr.", "Pascal Siakam",
-           "Julius Randle", "Scottie Barnes", "Draymond Green", "Tobias Harris"],
-    # Centers
-    "C": ["Nikola Jokic", "Joel Embiid", "Anthony Davis", "Bam Adebayo", "Rudy Gobert",
-          "Karl-Anthony Towns", "Domantas Sabonis", "Chet Holmgren", "Victor Wembanyama"]
-}
+
+def infer_position_from_stats(row: pd.Series) -> str:
+    """
+    Infiere la posición de un jugador basándose en sus estadísticas.
+
+    Heurística:
+    - Alto APM (asistencias por minuto) = Guard (PG/SG)
+    - Alto RPM (rebotes por minuto) + bajo APM = Big (C/PF)
+    - Balance = Forward (SF)
+    """
+    if row["min"] < 1:
+        return "UNKNOWN"
+
+    apm = row["ast"] / row["min"]
+    rpm = row["reb"] / row["min"]
+
+    # Thresholds basados en promedios típicos de la NBA
+    if apm > 0.25:  # ~7.5+ ast en 30 min = PG
+        return "PG"
+    elif rpm > 0.30 and apm < 0.10:  # ~9+ reb, <3 ast en 30 min = C
+        return "C"
+    elif rpm > 0.25:  # ~7.5+ reb en 30 min = PF
+        return "PF"
+    elif apm > 0.15:  # ~4.5+ ast en 30 min = SG
+        return "SG"
+    else:
+        return "SF"  # Default = SF
 
 
-def get_player_position(player_name: str) -> str:
-    """Obtiene la posición de un jugador."""
-    for position, players in POSITION_MAPPING.items():
-        if player_name in players:
-            return position
+def get_player_positions_from_stats(conn: sqlite3.Connection) -> pd.DataFrame:
+    """
+    Obtiene posiciones de jugadores basándose en sus promedios de stats.
 
-    # Por defecto, asignar basándose en estadísticas
-    # (más rebotes = big, más asistencias = guard)
+    Más robusto que un mapeo manual hardcodeado.
+    """
+    query = """
+        SELECT
+            player_id,
+            player_name,
+            AVG(pts) as avg_pts,
+            AVG(reb) as avg_reb,
+            AVG(ast) as avg_ast,
+            AVG(min) as avg_min,
+            COUNT(*) as games
+        FROM player_game_logs
+        WHERE min > 15
+        GROUP BY player_id, player_name
+        HAVING games >= 10
+    """
+
+    df = pd.read_sql(query, conn)
+
+    # Calcular ratios
+    df["rpm"] = df["avg_reb"] / df["avg_min"].replace(0, 1)
+    df["apm"] = df["avg_ast"] / df["avg_min"].replace(0, 1)
+
+    # Inferir posición
+    df["position"] = df.apply(lambda row: infer_position_from_stats(
+        pd.Series({"ast": row["avg_ast"], "reb": row["avg_reb"], "min": row["avg_min"]})
+    ), axis=1)
+
+    return df[["player_id", "player_name", "position"]]
+
+
+def get_player_position(player_name: str, positions_df: pd.DataFrame = None) -> str:
+    """Obtiene la posición de un jugador desde el DataFrame de posiciones."""
+    if positions_df is None:
+        return "UNKNOWN"
+
+    match = positions_df[positions_df["player_name"] == player_name]
+    if not match.empty:
+        return match["position"].iloc[0]
+
     return "UNKNOWN"
 
 
@@ -49,6 +95,15 @@ def calculate_dvp_from_game_logs():
     conn = sqlite3.connect(DB_PATH)
 
     print("Calculando Defense vs Position...")
+
+    # Primero obtener posiciones inferidas de estadísticas
+    print("Infiriendo posiciones de jugadores desde estadísticas...")
+    positions_df = get_player_positions_from_stats(conn)
+    print(f"Posiciones inferidas para {len(positions_df)} jugadores")
+
+    # Mostrar distribución de posiciones
+    pos_counts = positions_df["position"].value_counts()
+    print(f"Distribución: {pos_counts.to_dict()}")
 
     # Obtener todos los game logs con oponente
     query = """
@@ -69,10 +124,12 @@ def calculate_dvp_from_game_logs():
 
     if df.empty:
         print("No hay datos suficientes para calcular DvP")
+        conn.close()
         return
 
-    # Asignar posiciones
-    df["position"] = df["player_name"].apply(get_player_position)
+    # Asignar posiciones desde inference
+    df = df.merge(positions_df[["player_name", "position"]], on="player_name", how="left")
+    df["position"] = df["position"].fillna("UNKNOWN")
 
     # Filtrar jugadores con posición conocida
     df_known = df[df["position"] != "UNKNOWN"]
@@ -145,29 +202,33 @@ def get_dvp_rating(team_abbrev: str, position: str, season: str = "2024-25"):
     """
 
     result = pd.read_sql(query, conn, params=[team_abbrev, position, season])
-    conn.close()
 
     if result.empty:
+        conn.close()
         return None
 
     row = result.iloc[0]
 
     # Calcular rating comparando con la media de la liga
-    conn = sqlite3.connect(DB_PATH)
-    league_avg = pd.read_sql("""
-        SELECT
-            AVG(pts_allowed_avg) as league_pts,
-            STDEV(pts_allowed_avg) as std_pts
+    # NOTA: SQLite no tiene STDEV(), usamos pandas para calcularlo
+    league_data = pd.read_sql("""
+        SELECT pts_allowed_avg
         FROM defense_vs_position
         WHERE position = ? AND season = ?
     """, conn, params=[position, season])
     conn.close()
 
-    # Rating basado en desviaciones estándar
-    if not league_avg.empty and league_avg["std_pts"].values[0]:
-        z_score = (row["pts_allowed_avg"] - league_avg["league_pts"].values[0]) / league_avg["std_pts"].values[0]
-        # Convertir z-score a rating 1-5
-        rating = min(5, max(1, 3 + z_score))
+    # Rating basado en desviaciones estándar (calculado en Python)
+    if not league_data.empty and len(league_data) > 1:
+        league_mean = league_data["pts_allowed_avg"].mean()
+        league_std = league_data["pts_allowed_avg"].std()
+
+        if league_std > 0:
+            z_score = (row["pts_allowed_avg"] - league_mean) / league_std
+            # Convertir z-score a rating 1-5
+            rating = min(5, max(1, 3 + z_score))
+        else:
+            rating = 3
     else:
         rating = 3  # Neutral
 

@@ -271,18 +271,61 @@ def download_player_game_logs(player_id: int, player_name: str, season: str):
     return pd.DataFrame()
 
 
+def get_team_id_mapping(conn: sqlite3.Connection) -> dict:
+    """Obtiene mapeo de abreviatura de equipo a team_id."""
+    teams_df = pd.read_sql("SELECT team_id, abbreviation FROM teams", conn)
+    return dict(zip(teams_df["abbreviation"], teams_df["team_id"]))
+
+
 def save_game_logs(df: pd.DataFrame):
-    """Guarda los game logs en la base de datos."""
+    """
+    Guarda los game logs en la base de datos usando INSERT OR IGNORE.
+    También completa opponent_team_id.
+    """
     if df.empty:
         return 0
 
     conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
 
-    # Insert or replace para evitar duplicados
-    df.to_sql("player_game_logs", conn, if_exists="append", index=False)
+    # Obtener mapeo de equipos
+    team_mapping = get_team_id_mapping(conn)
 
+    # Completar opponent_team_id
+    df["opponent_team_id"] = df["opponent_abbrev"].map(team_mapping)
+
+    # Insertar fila por fila con INSERT OR IGNORE
+    columns = [
+        "player_id", "player_name", "season", "game_id", "game_date",
+        "matchup", "is_home", "wl", "min", "pts", "reb", "ast",
+        "stl", "blk", "tov", "fgm", "fga", "fg_pct", "fg3m", "fg3a",
+        "fg3_pct", "ftm", "fta", "ft_pct", "oreb", "dreb", "pf",
+        "plus_minus", "opponent_team_id", "opponent_abbrev"
+    ]
+
+    # Filtrar solo columnas que existen
+    available_cols = [c for c in columns if c in df.columns]
+
+    inserted = 0
+    for _, row in df.iterrows():
+        values = [row.get(c) for c in available_cols]
+        placeholders = ", ".join(["?"] * len(available_cols))
+        col_names = ", ".join(available_cols)
+
+        try:
+            cursor.execute(
+                f"INSERT OR IGNORE INTO player_game_logs ({col_names}) VALUES ({placeholders})",
+                values
+            )
+            if cursor.rowcount > 0:
+                inserted += 1
+        except sqlite3.Error as e:
+            # Log error pero continuar
+            continue
+
+    conn.commit()
     conn.close()
-    return len(df)
+    return inserted
 
 
 def get_processed_players(season: str) -> set:

@@ -8,14 +8,179 @@ Fuentes de cuotas:
 """
 
 import os
+import sys
 import json
-from datetime import datetime
+import sqlite3
+from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Optional
 import httpx
+import pandas as pd
+
+# Agregar paths
+sys.path.insert(0, str(Path(__file__).parent.parent / "models"))
+
+# nba_api para partidos del día
+try:
+    from nba_api.stats.endpoints import ScoreboardV2
+    from nba_api.stats.static import teams
+    NBA_API_AVAILABLE = True
+except ImportError:
+    NBA_API_AVAILABLE = False
 
 # API Key para The Odds API (gratuita: 500 requests/mes)
 ODDS_API_KEY = os.environ.get("ODDS_API_KEY", "")
 ODDS_API_BASE = "https://api.the-odds-api.com/v4"
+
+
+def fetch_real_odds_from_api() -> list:
+    """
+    Obtiene odds REALES de The Odds API.
+    Requiere ODDS_API_KEY configurada.
+    """
+    if not ODDS_API_KEY:
+        print("  ⚠️ ODDS_API_KEY no configurada")
+        return []
+
+    client = httpx.Client(timeout=30.0)
+    all_props = []
+
+    try:
+        # 1. Obtener todos los eventos de NBA
+        events_url = f"{ODDS_API_BASE}/sports/basketball_nba/events"
+        response = client.get(events_url, params={"apiKey": ODDS_API_KEY})
+
+        if response.status_code != 200:
+            print(f"  Error obteniendo eventos: {response.status_code}")
+            return []
+
+        events = response.json()
+        print(f"  📅 Eventos NBA: {len(events)}")
+
+        # 2. Obtener player props para cada evento
+        for event in events:
+            event_id = event.get("id")
+            home_team = event.get("home_team", "")
+            away_team = event.get("away_team", "")
+
+            # Mapear nombres de equipo a abreviaturas
+            team_abbrevs = {
+                "Philadelphia 76ers": "PHI", "Brooklyn Nets": "BKN",
+                "Los Angeles Lakers": "LAL", "Golden State Warriors": "GSW",
+                "Boston Celtics": "BOS", "Milwaukee Bucks": "MIL",
+                "Phoenix Suns": "PHX", "Denver Nuggets": "DEN",
+                "Miami Heat": "MIA", "Cleveland Cavaliers": "CLE",
+                "New York Knicks": "NYK", "Chicago Bulls": "CHI",
+                "Dallas Mavericks": "DAL", "Memphis Grizzlies": "MEM",
+                "Atlanta Hawks": "ATL", "Toronto Raptors": "TOR",
+                "Oklahoma City Thunder": "OKC", "Minnesota Timberwolves": "MIN",
+                "Sacramento Kings": "SAC", "Indiana Pacers": "IND",
+                "New Orleans Pelicans": "NOP", "Orlando Magic": "ORL",
+                "Charlotte Hornets": "CHA", "Houston Rockets": "HOU",
+                "San Antonio Spurs": "SAS", "Portland Trail Blazers": "POR",
+                "Utah Jazz": "UTA", "Washington Wizards": "WAS",
+                "Detroit Pistons": "DET", "LA Clippers": "LAC"
+            }
+
+            home_abbrev = team_abbrevs.get(home_team, home_team[:3].upper())
+            away_abbrev = team_abbrevs.get(away_team, away_team[:3].upper())
+
+            # Obtener props para este evento
+            props_url = f"{ODDS_API_BASE}/sports/basketball_nba/events/{event_id}/odds"
+
+            for market in ["player_points", "player_rebounds", "player_assists"]:
+                try:
+                    props_response = client.get(props_url, params={
+                        "apiKey": ODDS_API_KEY,
+                        "regions": "us",
+                        "markets": market,
+                        "oddsFormat": "decimal"
+                    })
+
+                    if props_response.status_code == 200:
+                        data = props_response.json()
+                        bookmakers = data.get("bookmakers", [])
+
+                        for book in bookmakers:
+                            book_name = book.get("title", "Unknown")
+                            markets = book.get("markets", [])
+
+                            for mkt in markets:
+                                outcomes = mkt.get("outcomes", [])
+
+                                # Agrupar por jugador
+                                player_lines = {}
+                                for outcome in outcomes:
+                                    player = outcome.get("description", "")
+                                    line = outcome.get("point", 0)
+                                    odds = outcome.get("price", 1.91)
+                                    over_under = outcome.get("name", "")
+
+                                    if player not in player_lines:
+                                        player_lines[player] = {"lines": {}}
+
+                                    if line not in player_lines[player]["lines"]:
+                                        player_lines[player]["lines"][line] = {}
+
+                                    if over_under == "Over":
+                                        player_lines[player]["lines"][line]["over"] = odds
+                                    else:
+                                        player_lines[player]["lines"][line]["under"] = odds
+
+                                # Agregar props
+                                stat = market.replace("player_", "")[:3]  # points -> pts
+                                for player, data in player_lines.items():
+                                    # Usar la línea más común (típicamente la del medio)
+                                    lines = list(data["lines"].keys())
+                                    if lines:
+                                        # Tomar la línea con odds más cercanos a 1.91
+                                        best_line = None
+                                        best_balance = float('inf')
+                                        for line_val in lines:
+                                            line_data = data["lines"][line_val]
+                                            over = line_data.get("over", 1.91)
+                                            under = line_data.get("under", 1.91)
+                                            balance = abs(over - under)
+                                            if balance < best_balance:
+                                                best_balance = balance
+                                                best_line = line_val
+
+                                        if best_line:
+                                            line_data = data["lines"][best_line]
+                                            all_props.append({
+                                                "player": player,
+                                                "team": home_abbrev if player else away_abbrev,
+                                                "opponent": away_abbrev,
+                                                "home_team": home_team,
+                                                "away_team": away_team,
+                                                "stat": stat,
+                                                "line": best_line,
+                                                "over_odds": line_data.get("over", 1.91),
+                                                "under_odds": line_data.get("under", 1.91),
+                                                "source": book_name
+                                            })
+
+                except Exception as e:
+                    continue
+
+            # Pequeña pausa para no saturar la API
+            import time
+            time.sleep(0.1)
+
+    except Exception as e:
+        print(f"  Error: {e}")
+
+    # Deduplicar: quedarse con el primer registro por jugador+stat
+    seen = set()
+    unique_props = []
+    for prop in all_props:
+        key = (prop["player"], prop["stat"])
+        if key not in seen:
+            seen.add(key)
+            unique_props.append(prop)
+
+    print(f"  ✅ Props únicos: {len(unique_props)}")
+    return unique_props
 
 
 class OddsFetcher:
@@ -98,6 +263,13 @@ class OddsFetcher:
 
     def _get_mock_games(self) -> list:
         """Datos mock para desarrollo sin API key."""
+        # Intentar obtener partidos reales de hoy
+        if NBA_API_AVAILABLE:
+            try:
+                return self._get_todays_real_games()
+            except Exception as e:
+                print(f"  (Usando partidos mock: {e})")
+
         return [
             {
                 "id": "mock_game_1",
@@ -115,8 +287,139 @@ class OddsFetcher:
             }
         ]
 
+    def _get_todays_real_games(self) -> list:
+        """Obtiene los partidos reales programados para hoy desde NBA API."""
+        import time
+        from nba_api.stats.endpoints import ScoreboardV2
+
+        # Obtener scoreboard de hoy
+        scoreboard = ScoreboardV2(game_date=datetime.now().strftime("%Y-%m-%d"))
+        time.sleep(1)
+
+        games_df = scoreboard.get_data_frames()[0]
+
+        if games_df.empty:
+            print("  No hay partidos programados para hoy")
+            return []
+
+        real_games = []
+        team_dict = {t["id"]: t for t in teams.get_teams()}
+
+        for _, game in games_df.iterrows():
+            home_id = game.get("HOME_TEAM_ID")
+            away_id = game.get("VISITOR_TEAM_ID")
+
+            home_team = team_dict.get(home_id, {}).get("full_name", "Unknown")
+            away_team = team_dict.get(away_id, {}).get("full_name", "Unknown")
+
+            real_games.append({
+                "id": str(game.get("GAME_ID", "")),
+                "sport_key": "basketball_nba",
+                "home_team": home_team,
+                "away_team": away_team,
+                "home_abbrev": team_dict.get(home_id, {}).get("abbreviation", ""),
+                "away_abbrev": team_dict.get(away_id, {}).get("abbreviation", ""),
+                "commence_time": datetime.now().isoformat()
+            })
+
+        print(f"  Encontrados {len(real_games)} partidos para hoy")
+        return real_games
+
     def _get_mock_player_props(self, player_name: str = None) -> list:
-        """Props mock para desarrollo."""
+        """
+        Genera props basados en partidos reales de hoy.
+        Usa líneas aproximadas basadas en promedios históricos.
+        """
+        # Obtener partidos de hoy
+        games = self._get_todays_real_games() if NBA_API_AVAILABLE else []
+
+        if not games:
+            # Si no hay partidos reales, usar mock estático
+            return self._get_static_mock_props(player_name)
+
+        # Obtener top jugadores de cada equipo desde nuestra DB
+        db_path = Path(__file__).parent.parent / "data" / "nba_props.db"
+        if not db_path.exists():
+            return self._get_static_mock_props(player_name)
+
+        conn = sqlite3.connect(db_path)
+        props = []
+        seen_players = set()  # Para evitar duplicados
+
+        for game in games:
+            home_abbrev = game.get("home_abbrev", "")
+            away_abbrev = game.get("away_abbrev", "")
+
+            if not home_abbrev or not away_abbrev:
+                continue
+
+            # Obtener top 3 jugadores de cada equipo por puntos promedio
+            for team_abbrev, opponent_abbrev, is_home in [
+                (home_abbrev, away_abbrev, True),
+                (away_abbrev, home_abbrev, False)
+            ]:
+                try:
+                    # Buscar jugadores del equipo - matchup empieza con la abreviatura del equipo
+                    query = """
+                        SELECT player_name,
+                               AVG(pts) as avg_pts,
+                               AVG(reb) as avg_reb,
+                               AVG(ast) as avg_ast,
+                               COUNT(*) as games
+                        FROM player_game_logs
+                        WHERE (matchup LIKE ? OR matchup LIKE ?)
+                          AND season = '2024-25'
+                        GROUP BY player_name
+                        HAVING games >= 5
+                        ORDER BY avg_pts DESC
+                        LIMIT 3
+                    """
+                    # Matchup format: "LAL vs. GSW" o "LAL @ GSW"
+                    df = pd.read_sql(query, conn, params=[
+                        f"{team_abbrev} vs.%",
+                        f"{team_abbrev} @%"
+                    ])
+
+                    for _, player in df.iterrows():
+                        player_name_db = player["player_name"]
+
+                        # Evitar duplicados
+                        if player_name_db in seen_players:
+                            continue
+                        seen_players.add(player_name_db)
+
+                        # Crear líneas basadas en promedios (redondeadas a .5)
+                        pts_line = round(player["avg_pts"] * 2) / 2
+                        reb_line = round(player["avg_reb"] * 2) / 2
+                        ast_line = round(player["avg_ast"] * 2) / 2
+
+                        props.append({
+                            "player": player_name_db,
+                            "team": team_abbrev,
+                            "opponent": opponent_abbrev,
+                            "is_home": is_home,
+                            "props": {
+                                "pts": {"line": pts_line, "over_odds": 1.91, "under_odds": 1.91},
+                                "reb": {"line": reb_line, "over_odds": 1.91, "under_odds": 1.91},
+                                "ast": {"line": ast_line, "over_odds": 1.91, "under_odds": 1.91}
+                            }
+                        })
+                except Exception as e:
+                    print(f"  Error buscando jugadores de {team_abbrev}: {e}")
+                    continue
+
+        conn.close()
+
+        if not props:
+            return self._get_static_mock_props(player_name)
+
+        if player_name:
+            return [p for p in props if player_name.lower() in p["player"].lower()]
+
+        return props
+
+    def _get_static_mock_props(self, player_name: str = None) -> list:
+        """Props mock estáticos cuando no hay datos reales."""
         mock_props = [
             {
                 "player": "LeBron James",
@@ -127,42 +430,10 @@ class OddsFetcher:
                     "reb": {"line": 7.5, "over_odds": 1.87, "under_odds": 1.95},
                     "ast": {"line": 8.5, "over_odds": 1.90, "under_odds": 1.90}
                 }
-            },
-            {
-                "player": "Stephen Curry",
-                "team": "GSW",
-                "opponent": "LAL",
-                "props": {
-                    "pts": {"line": 28.5, "over_odds": 1.95, "under_odds": 1.87},
-                    "reb": {"line": 5.5, "over_odds": 1.90, "under_odds": 1.90},
-                    "ast": {"line": 5.5, "over_odds": 1.85, "under_odds": 1.97}
-                }
-            },
-            {
-                "player": "Jayson Tatum",
-                "team": "BOS",
-                "opponent": "MIL",
-                "props": {
-                    "pts": {"line": 27.5, "over_odds": 1.90, "under_odds": 1.90},
-                    "reb": {"line": 8.5, "over_odds": 1.91, "under_odds": 1.91},
-                    "ast": {"line": 4.5, "over_odds": 1.87, "under_odds": 1.95}
-                }
-            },
-            {
-                "player": "Giannis Antetokounmpo",
-                "team": "MIL",
-                "opponent": "BOS",
-                "props": {
-                    "pts": {"line": 31.5, "over_odds": 1.90, "under_odds": 1.90},
-                    "reb": {"line": 11.5, "over_odds": 1.87, "under_odds": 1.95},
-                    "ast": {"line": 5.5, "over_odds": 1.91, "under_odds": 1.91}
-                }
             }
         ]
-
         if player_name:
             return [p for p in mock_props if player_name.lower() in p["player"].lower()]
-
         return mock_props
 
 
@@ -240,6 +511,9 @@ class EVCalculator:
                 implied_under = EVCalculator.implied_probability(under_odds)
 
                 # Si hay valor, agregar a la lista
+                pred_value = pred.get("prediction", 0)
+                pred_rounded = round(pred_value, 1) if pred_value else 0
+
                 if ev_over >= min_ev:
                     value_bets.append({
                         "player": player,
@@ -252,7 +526,7 @@ class EVCalculator:
                         "implied_probability": round(implied_over * 100, 1),
                         "edge": round((prob_over - implied_over) * 100, 1),
                         "ev": round(ev_over * 100, 1),
-                        "model_prediction": pred.get("prediction")
+                        "model_prediction": pred_rounded
                     })
 
                 if ev_under >= min_ev:
@@ -267,7 +541,7 @@ class EVCalculator:
                         "implied_probability": round(implied_under * 100, 1),
                         "edge": round((prob_under - implied_under) * 100, 1),
                         "ev": round(ev_under * 100, 1),
-                        "model_prediction": pred.get("prediction")
+                        "model_prediction": pred_rounded
                     })
 
         # Ordenar por EV descendente
@@ -289,11 +563,51 @@ def scan_for_value():
     print("ESCÁNER DE VALOR - NBA PROPS")
     print("="*60)
 
-    # Obtener cuotas
-    fetcher = OddsFetcher()
-    props = fetcher.get_player_props()
+    # Intentar obtener odds reales primero
+    real_props = []
+    if ODDS_API_KEY:
+        print("\n🔴 USANDO ODDS REALES (The Odds API)")
+        real_props = fetch_real_odds_from_api()
 
-    print(f"\nProps encontrados: {len(props)} jugadores")
+    if real_props:
+        # Convertir formato de API a formato esperado
+        props = []
+        seen_players = set()
+
+        for rp in real_props:
+            player = rp["player"]
+            if player in seen_players:
+                # Ya existe, agregar stat
+                for p in props:
+                    if p["player"] == player:
+                        p["props"][rp["stat"]] = {
+                            "line": rp["line"],
+                            "over_odds": rp["over_odds"],
+                            "under_odds": rp["under_odds"]
+                        }
+                        break
+            else:
+                seen_players.add(player)
+                props.append({
+                    "player": player,
+                    "opponent": rp["opponent"],
+                    "is_home": True,  # TODO: determinar correctamente
+                    "source": rp.get("source", "API"),
+                    "props": {
+                        rp["stat"]: {
+                            "line": rp["line"],
+                            "over_odds": rp["over_odds"],
+                            "under_odds": rp["under_odds"]
+                        }
+                    }
+                })
+
+        print(f"\n✅ Props reales: {len(props)} jugadores")
+    else:
+        print("\n⚠️ Usando datos estimados (sin API key)")
+        fetcher = OddsFetcher()
+        props = fetcher.get_player_props()
+        print(f"\nProps encontrados: {len(props)} jugadores")
 
     # Obtener predicciones
     try:
@@ -305,32 +619,61 @@ def scan_for_value():
         for prop in props:
             player = prop["player"]
             opponent = prop["opponent"]
+            is_home = prop.get("is_home", True)
 
-            print(f"\nAnalizando: {player} vs {opponent}")
+            # Evitar predecir el mismo jugador múltiples veces
+            if player in predictions:
+                continue
 
-            for stat in ["pts", "reb", "ast"]:
-                try:
-                    result = predictor.predict_player(player, opponent)
+            source = prop.get("source", "")
+            source_tag = f" [{source}]" if source else ""
+            print(f"\nAnalizando: {player} vs {opponent}{source_tag}")
 
-                    if "error" not in result:
-                        pred_value = result["predictions"][stat]
-                        std_value = result["std"][stat]
+            try:
+                result = predictor.predict_player(player, opponent, is_home=is_home)
 
-                        # Calcular probabilidad de over para cada línea
-                        line = prop["props"][stat]["line"]
-                        prob_over = predictor.calculate_over_probability(
-                            pred_value, line, std_value
+                if "error" in result:
+                    print(f"  ⚠️ {result['error']}")
+                    continue
+
+                predictions[player] = {}
+
+                # Solo procesar stats que existen en props
+                available_stats = list(prop.get("props", {}).keys())
+
+                for stat in available_stats:
+                    if stat not in ["pts", "reb", "ast"]:
+                        continue
+
+                    pred_value = result["predictions"].get(stat, 0)
+                    stat_data = prop["props"].get(stat, {})
+                    line = stat_data.get("line", 0)
+
+                    if not line:
+                        continue
+
+                    if stat == "pts":
+                        # Usar cuantiles para puntos
+                        p15 = result["predictions_pts"]["p15_floor"]
+                        p50 = result["predictions_pts"]["p50_median"]
+                        p85 = result["predictions_pts"]["p85_ceiling"]
+                        prob_over = predictor.calculate_probability_from_quantiles(
+                            p15, p50, p85, line
                         )
+                    else:
+                        # Para reb/ast usar aproximación basada en mediana
+                        diff = pred_value - line
+                        prob_over = 0.5 + (diff / (abs(diff) + 2)) * 0.3
 
-                        if player not in predictions:
-                            predictions[player] = {}
+                    predictions[player][stat] = {
+                        "prediction": pred_value,
+                        "prob_over": prob_over,
+                        "p15": result["predictions_pts"]["p15_floor"] if stat == "pts" else None,
+                        "p85": result["predictions_pts"]["p85_ceiling"] if stat == "pts" else None
+                    }
 
-                        predictions[player][stat] = {
-                            "prediction": pred_value,
-                            "prob_over": prob_over
-                        }
-                except Exception as e:
-                    print(f"  Error con {player}/{stat}: {e}")
+            except Exception as e:
+                print(f"  Error con {player}: {e}")
 
     except Exception as e:
         print(f"\nModelo no disponible: {e}")
@@ -372,11 +715,14 @@ def scan_for_value():
         print("\nNo se encontraron apuestas con EV > 3%")
     else:
         for i, bet in enumerate(value_bets[:10], 1):
+            pred = f"{bet['model_prediction']:.1f}" if bet['model_prediction'] else "N/A"
+            prob = f"{bet['model_probability']:.1f}"
+            edge = f"{bet['edge']:.1f}"
+            ev = f"{bet['ev']:.1f}"
             print(f"\n#{i} {bet['player']} - {bet['stat'].upper()} {bet['bet_type']}")
             print(f"   Línea: {bet['line']} @ {bet['odds']}")
-            print(f"   Predicción modelo: {bet['model_prediction']}")
-            print(f"   Prob modelo: {bet['model_probability']}% vs Mercado: {bet['implied_probability']}%")
-            print(f"   Edge: +{bet['edge']}% | EV: +{bet['ev']}%")
+            print(f"   Predicción: {pred} | Prob: {prob}%")
+            print(f"   Edge: +{edge}% | EV: +{ev}%")
 
     return value_bets
 

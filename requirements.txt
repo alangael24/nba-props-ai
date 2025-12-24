@@ -25,3 +25,4 @@ httpx
 
 # Telegram (opcional)
 python-telegram-bot
+beautifulsoup4

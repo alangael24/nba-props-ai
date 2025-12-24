@@ -111,19 +111,19 @@ def quick_predict(player_name: str, opponent: str):
         print(f"Error: {result['error']}")
         return result
 
-    print(f"\nPredicciones:")
+    print(f"\nPredicciones (Mediana P50):")
     print(f"  Puntos: {result['predictions']['pts']}")
     print(f"  Rebotes: {result['predictions']['reb']}")
     print(f"  Asistencias: {result['predictions']['ast']}")
 
-    print(f"\nVolatilidad (std):")
-    print(f"  Puntos: ±{result['std']['pts']}")
-    print(f"  Rebotes: ±{result['std']['reb']}")
-    print(f"  Asistencias: ±{result['std']['ast']}")
+    print(f"\nRango de Puntos (Cuantiles):")
+    print(f"  P15 (piso):    {result['predictions_pts']['p15_floor']} pts")
+    print(f"  P50 (mediana): {result['predictions_pts']['p50_median']} pts")
+    print(f"  P85 (techo):   {result['predictions_pts']['p85_ceiling']} pts")
 
-    print(f"\nHistórico:")
-    print(f"  Promedio últimos 5: {result['historical']['avg_pts_5']}")
-    print(f"  Promedio temporada: {result['historical']['avg_pts_season']}")
+    print(f"\nMinutos esperados:")
+    print(f"  Rango: {result['minutes']['p15_floor']} - {result['minutes']['p85_ceiling']} min")
+    print(f"  Últimos 5: {result['minutes']['avg_last_5']} min")
 
     return result
 

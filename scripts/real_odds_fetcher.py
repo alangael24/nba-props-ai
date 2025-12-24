@@ -10,6 +10,15 @@ from datetime import datetime
 from bs4 import BeautifulSoup
 from typing import Optional, Dict, List
 
+# Importar fuzzy matcher para resolver nombres
+try:
+    from scripts.utils.name_matcher import PlayerNameMatcher
+except ImportError:
+    try:
+        from utils.name_matcher import PlayerNameMatcher
+    except ImportError:
+        PlayerNameMatcher = None
+
 
 class RealOddsFetcher:
     """Obtiene odds reales de fuentes públicas."""
@@ -25,6 +34,14 @@ class RealOddsFetcher:
             }
         )
         self.props_cache = {}
+        self.props_list = []  # Lista de props para fuzzy search
+
+        # Inicializar name matcher para fuzzy matching
+        if PlayerNameMatcher is not None:
+            self.name_matcher = PlayerNameMatcher()
+        else:
+            self.name_matcher = None
+            print("  ⚠️ PlayerNameMatcher no disponible - usando exact match")
 
     def fetch_prizepicks_lines(self) -> List[Dict]:
         """
@@ -268,15 +285,50 @@ class RealOddsFetcher:
     def get_player_prop(self, player_name: str, stat: str = "pts") -> Optional[Dict]:
         """
         Busca la línea de un jugador específico.
+
+        Usa fuzzy matching para resolver diferencias de nombres:
+        - "Nic Claxton" vs "Nicolas Claxton"
+        - "PJ Washington" vs "P.J. Washington"
         """
         if not self.props_cache:
+            props = self.fetch_all_sources()
+            self.props_list = props
             self.props_cache = {
                 (p["player"].lower(), p["stat"]): p
-                for p in self.fetch_all_sources()
+                for p in props
             }
 
+        # Primero intentar exact match
         key = (player_name.lower(), stat)
-        return self.props_cache.get(key)
+        if key in self.props_cache:
+            return self.props_cache[key]
+
+        # Si no hay match exacto, usar fuzzy matching
+        if self.name_matcher is not None and self.props_list:
+            # Obtener todos los nombres de jugadores con el stat buscado
+            player_names_with_stat = [
+                p["player"] for p in self.props_list
+                if p["stat"] == stat
+            ]
+
+            if player_names_with_stat:
+                # Buscar el mejor match
+                matched_name = self.name_matcher.find_best_match(
+                    player_name,
+                    player_names_with_stat,
+                    threshold=85  # 85% similarity threshold
+                )
+
+                if matched_name:
+                    key = (matched_name.lower(), stat)
+                    prop = self.props_cache.get(key)
+                    if prop:
+                        # Agregar info de que fue fuzzy match
+                        prop["matched_from"] = player_name
+                        prop["matched_to"] = matched_name
+                        return prop
+
+        return None
 
     def _normalize_stat(self, stat: str) -> str:
         """Normaliza nombres de stats."""

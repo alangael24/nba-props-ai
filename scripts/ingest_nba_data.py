@@ -17,7 +17,8 @@ from nba_api.stats.endpoints import (
     PlayerGameLog,
     CommonAllPlayers,
     LeagueDashTeamStats,
-    TeamGameLog
+    TeamGameLog,
+    BoxScoreTraditionalV2
 )
 from nba_api.stats.static import teams
 
@@ -113,10 +114,64 @@ def create_database():
         )
     """)
 
+    # Tabla para contexto de compañeros (Teammates Available)
+    # Trackea si los jugadores clave del equipo estuvieron disponibles
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS teammate_context (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            player_id INTEGER NOT NULL,
+            game_id TEXT NOT NULL,
+            game_date DATE NOT NULL,
+            team_id INTEGER NOT NULL,
+            -- Métricas de disponibilidad de compañeros
+            star1_available INTEGER DEFAULT 1,  -- 1 = jugó, 0 = no jugó
+            star2_available INTEGER DEFAULT 1,
+            star3_available INTEGER DEFAULT 1,
+            total_stars_available INTEGER DEFAULT 3,
+            -- Contexto adicional
+            primary_pg_available INTEGER DEFAULT 1,  -- Point guard principal
+            primary_center_available INTEGER DEFAULT 1,  -- Center principal
+            team_minutes_load REAL,  -- Total minutos del equipo (detecta blowouts)
+            -- Para cálculo de usage boost
+            usage_boost_expected REAL DEFAULT 0,  -- Boost esperado si faltan estrellas
+            UNIQUE(player_id, game_id)
+        )
+    """)
+
+    # Tabla para identificar jugadores clave por equipo
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS team_key_players (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            team_id INTEGER NOT NULL,
+            team_abbrev TEXT,
+            season TEXT NOT NULL,
+            -- Top 3 jugadores por scoring
+            star1_player_id INTEGER,
+            star1_name TEXT,
+            star1_ppg REAL,
+            star2_player_id INTEGER,
+            star2_name TEXT,
+            star2_ppg REAL,
+            star3_player_id INTEGER,
+            star3_name TEXT,
+            star3_ppg REAL,
+            -- Rol específico
+            primary_pg_id INTEGER,
+            primary_pg_name TEXT,
+            primary_center_id INTEGER,
+            primary_center_name TEXT,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(team_id, season)
+        )
+    """)
+
     # Índices para consultas rápidas
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_game_logs_player ON player_game_logs(player_id)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_game_logs_date ON player_game_logs(game_date)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_game_logs_opponent ON player_game_logs(opponent_team_id)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_game_logs_game_id ON player_game_logs(game_id)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_teammate_context_player ON teammate_context(player_id)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_teammate_context_game ON teammate_context(game_id)")
 
     conn.commit()
     conn.close()
@@ -462,17 +517,295 @@ def quick_stats():
     conn.close()
 
 
+# =============================================================================
+# TEAMMATE CONTEXT - Ingesta de contexto de compañeros
+# =============================================================================
+
+def identify_team_key_players(season: str):
+    """
+    Identifica los jugadores clave de cada equipo basándose en los game logs.
+
+    Para cada equipo encuentra:
+    - Top 3 anotadores (estrellas)
+    - Point guard principal (más asistencias)
+    - Center principal (más rebotes)
+    """
+    print(f"\n[TEAMMATES] Identificando jugadores clave para {season}...")
+
+    conn = sqlite3.connect(DB_PATH)
+
+    # Obtener promedios por jugador/equipo
+    query = """
+        SELECT
+            p.player_id,
+            p.player_name,
+            p.team_id,
+            t.abbreviation as team_abbrev,
+            AVG(g.pts) as ppg,
+            AVG(g.reb) as rpg,
+            AVG(g.ast) as apg,
+            AVG(g.min) as mpg,
+            COUNT(*) as games
+        FROM player_game_logs g
+        JOIN players p ON g.player_id = p.player_id
+        JOIN teams t ON p.team_id = t.team_id
+        WHERE g.season = ?
+            AND g.min >= 15
+        GROUP BY g.player_id
+        HAVING games >= 10
+    """
+
+    df = pd.read_sql(query, conn, params=[season])
+
+    if df.empty:
+        print("  No hay suficientes datos para identificar jugadores clave")
+        conn.close()
+        return
+
+    teams_processed = 0
+
+    # Para cada equipo, identificar jugadores clave
+    for team_id in df["team_id"].unique():
+        team_df = df[df["team_id"] == team_id].copy()
+        team_abbrev = team_df["team_abbrev"].iloc[0]
+
+        if len(team_df) < 3:
+            continue
+
+        # Top 3 por puntos (estrellas)
+        top_scorers = team_df.nlargest(3, "ppg")
+
+        # Point guard (más asistencias entre los que promedian >3 apg)
+        pgs = team_df[team_df["apg"] >= 3].nlargest(1, "apg")
+        primary_pg = pgs.iloc[0] if len(pgs) > 0 else None
+
+        # Center (más rebotes entre los que promedian >5 rpg)
+        centers = team_df[team_df["rpg"] >= 5].nlargest(1, "rpg")
+        primary_center = centers.iloc[0] if len(centers) > 0 else None
+
+        # Insertar en team_key_players
+        cursor = conn.cursor()
+        cursor.execute("""
+            INSERT OR REPLACE INTO team_key_players
+            (team_id, team_abbrev, season,
+             star1_player_id, star1_name, star1_ppg,
+             star2_player_id, star2_name, star2_ppg,
+             star3_player_id, star3_name, star3_ppg,
+             primary_pg_id, primary_pg_name,
+             primary_center_id, primary_center_name)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            int(team_id), team_abbrev, season,
+            int(top_scorers.iloc[0]["player_id"]), top_scorers.iloc[0]["player_name"], round(top_scorers.iloc[0]["ppg"], 1),
+            int(top_scorers.iloc[1]["player_id"]), top_scorers.iloc[1]["player_name"], round(top_scorers.iloc[1]["ppg"], 1),
+            int(top_scorers.iloc[2]["player_id"]) if len(top_scorers) > 2 else None,
+            top_scorers.iloc[2]["player_name"] if len(top_scorers) > 2 else None,
+            round(top_scorers.iloc[2]["ppg"], 1) if len(top_scorers) > 2 else None,
+            int(primary_pg["player_id"]) if primary_pg is not None else None,
+            primary_pg["player_name"] if primary_pg is not None else None,
+            int(primary_center["player_id"]) if primary_center is not None else None,
+            primary_center["player_name"] if primary_center is not None else None
+        ))
+
+        teams_processed += 1
+
+    conn.commit()
+    conn.close()
+    print(f"  ✅ Identificados jugadores clave para {teams_processed} equipos")
+
+
+def build_teammate_context(season: str):
+    """
+    Construye el contexto de compañeros para cada partido.
+
+    Para cada jugador en cada partido, determina:
+    - ¿Estaban jugando las estrellas del equipo?
+    - ¿Estaba el PG/C principal?
+    - ¿Cuánto usage boost se espera si faltan estrellas?
+    """
+    print(f"\n[TEAMMATES] Construyendo contexto de compañeros para {season}...")
+
+    conn = sqlite3.connect(DB_PATH)
+
+    # Obtener jugadores clave por equipo
+    key_players_df = pd.read_sql("""
+        SELECT * FROM team_key_players WHERE season = ?
+    """, conn, params=[season])
+
+    if key_players_df.empty:
+        print("  ⚠️ No hay jugadores clave identificados. Ejecuta --identify-stars primero.")
+        conn.close()
+        return
+
+    # Crear diccionario de key players por team_id
+    key_players = {}
+    for _, row in key_players_df.iterrows():
+        key_players[row["team_id"]] = {
+            "stars": [row["star1_player_id"], row["star2_player_id"], row["star3_player_id"]],
+            "star_ppg": [row["star1_ppg"], row["star2_ppg"], row["star3_ppg"]],
+            "pg": row["primary_pg_id"],
+            "center": row["primary_center_id"]
+        }
+
+    # Obtener todos los game_ids únicos
+    games_df = pd.read_sql("""
+        SELECT DISTINCT game_id, game_date
+        FROM player_game_logs
+        WHERE season = ?
+        ORDER BY game_date
+    """, conn, params=[season])
+
+    print(f"  Procesando {len(games_df)} partidos...")
+
+    inserted = 0
+
+    for _, game in tqdm(games_df.iterrows(), total=len(games_df), desc="  Contexto"):
+        game_id = game["game_id"]
+        game_date = game["game_date"]
+
+        # Obtener todos los jugadores que jugaron en este partido
+        players_in_game = pd.read_sql("""
+            SELECT player_id, player_name, min
+            FROM player_game_logs
+            WHERE game_id = ? AND min > 0
+        """, conn, params=[game_id])
+
+        players_set = set(players_in_game["player_id"].tolist())
+
+        # Para cada jugador que jugó, calcular contexto
+        for _, player_row in players_in_game.iterrows():
+            player_id = player_row["player_id"]
+
+            # Obtener equipo del jugador
+            team_query = pd.read_sql("""
+                SELECT team_id FROM players WHERE player_id = ?
+            """, conn, params=[int(player_id)])
+
+            if team_query.empty:
+                continue
+
+            team_id = team_query.iloc[0]["team_id"]
+
+            if team_id not in key_players:
+                continue
+
+            kp = key_players[team_id]
+
+            # Calcular disponibilidad de estrellas (excluyendo al jugador mismo)
+            stars = [s for s in kp["stars"] if s is not None and s != player_id]
+            star_ppgs = [ppg for s, ppg in zip(kp["stars"], kp["star_ppg"])
+                        if s is not None and s != player_id and ppg is not None]
+
+            star1_available = 1 if len(stars) > 0 and stars[0] in players_set else 0
+            star2_available = 1 if len(stars) > 1 and stars[1] in players_set else 0
+            star3_available = 1 if len(stars) > 2 and stars[2] in players_set else 0
+            total_stars = star1_available + star2_available + star3_available
+
+            # PG y Center
+            pg_available = 1 if kp["pg"] is None or kp["pg"] == player_id or kp["pg"] in players_set else 0
+            center_available = 1 if kp["center"] is None or kp["center"] == player_id or kp["center"] in players_set else 0
+
+            # Calcular usage boost esperado
+            # Si falta una estrella de 25 PPG, se reparte entre los demás
+            usage_boost = 0.0
+            missing_ppg = 0
+            if len(stars) > 0 and star1_available == 0 and len(star_ppgs) > 0:
+                missing_ppg += star_ppgs[0]
+            if len(stars) > 1 and star2_available == 0 and len(star_ppgs) > 1:
+                missing_ppg += star_ppgs[1]
+
+            # Usage boost = % del PPG perdido que podría absorber este jugador
+            # Simplificación: 20% del PPG perdido se reparte
+            if missing_ppg > 0:
+                usage_boost = missing_ppg * 0.20
+
+            # Insertar contexto
+            try:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    INSERT OR IGNORE INTO teammate_context
+                    (player_id, game_id, game_date, team_id,
+                     star1_available, star2_available, star3_available, total_stars_available,
+                     primary_pg_available, primary_center_available, usage_boost_expected)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    int(player_id), game_id, game_date, int(team_id),
+                    star1_available, star2_available, star3_available, total_stars,
+                    pg_available, center_available, round(usage_boost, 2)
+                ))
+                if cursor.rowcount > 0:
+                    inserted += 1
+            except sqlite3.Error:
+                continue
+
+    conn.commit()
+    conn.close()
+    print(f"  ✅ Guardados {inserted} registros de contexto de compañeros")
+
+
+def run_teammate_analysis():
+    """Ejecuta el análisis completo de teammates."""
+    print("\n" + "=" * 60)
+    print("ANÁLISIS DE CONTEXTO DE COMPAÑEROS (TEAMMATES)")
+    print("=" * 60)
+
+    # Asegurar que las tablas existen
+    create_database()
+
+    for season in SEASONS:
+        # Paso 1: Identificar jugadores clave
+        identify_team_key_players(season)
+
+        # Paso 2: Construir contexto de compañeros
+        build_teammate_context(season)
+
+    # Mostrar resumen
+    conn = sqlite3.connect(DB_PATH)
+
+    print("\n--- RESUMEN DE KEY PLAYERS ---")
+    key_players = pd.read_sql("""
+        SELECT team_abbrev, season, star1_name, star1_ppg, star2_name, star2_ppg
+        FROM team_key_players
+        ORDER BY season DESC, star1_ppg DESC
+        LIMIT 10
+    """, conn)
+    print(key_players.to_string(index=False))
+
+    print("\n--- MUESTRA DE CONTEXTO ---")
+    context_sample = pd.read_sql("""
+        SELECT
+            tc.game_date,
+            p.player_name,
+            tc.total_stars_available,
+            tc.usage_boost_expected
+        FROM teammate_context tc
+        JOIN players p ON tc.player_id = p.player_id
+        WHERE tc.usage_boost_expected > 0
+        ORDER BY tc.usage_boost_expected DESC
+        LIMIT 10
+    """, conn)
+    print(context_sample.to_string(index=False))
+
+    conn.close()
+
+
 if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(description="Ingesta de datos NBA")
     parser.add_argument("--stats", action="store_true", help="Mostrar estadísticas de la DB")
     parser.add_argument("--quick", action="store_true", help="Solo descargar temporada actual")
+    parser.add_argument("--teammates", action="store_true",
+                        help="Construir contexto de compañeros (teammates available)")
 
     args = parser.parse_args()
 
     if args.stats:
         quick_stats()
+    elif args.teammates:
+        if args.quick:
+            SEASONS = ["2024-25"]
+        run_teammate_analysis()
     else:
         if args.quick:
             SEASONS = ["2024-25"]

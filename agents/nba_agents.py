@@ -16,6 +16,10 @@ from pathlib import Path
 from typing import Any, Optional
 
 import anthropic
+import httpx
+
+# API Keys para búsqueda de noticias
+SERPER_API_KEY = os.environ.get("SERPER_API_KEY", "")  # Serper.dev - $50 por 50K búsquedas
 
 # Paths
 DB_PATH = Path(__file__).parent.parent / "data" / "nba_props.db"
@@ -160,25 +164,167 @@ MAKE_FINAL_DECISION_TOOL = {
 # IMPLEMENTACIÓN DE HERRAMIENTAS
 # =============================================================================
 
+def _search_serper(query: str, num_results: int = 5) -> list:
+    """
+    Busca en Google usando Serper.dev API.
+
+    Returns:
+        Lista de resultados con title, snippet, link
+    """
+    if not SERPER_API_KEY:
+        return []
+
+    try:
+        response = httpx.post(
+            "https://google.serper.dev/search",
+            headers={
+                "X-API-KEY": SERPER_API_KEY,
+                "Content-Type": "application/json"
+            },
+            json={
+                "q": query,
+                "num": num_results,
+                "gl": "us",
+                "hl": "en"
+            },
+            timeout=10.0
+        )
+        response.raise_for_status()
+        data = response.json()
+
+        results = []
+        for item in data.get("organic", [])[:num_results]:
+            results.append({
+                "title": item.get("title", ""),
+                "snippet": item.get("snippet", ""),
+                "link": item.get("link", ""),
+                "date": item.get("date", "")
+            })
+
+        return results
+    except Exception as e:
+        print(f"  [ERROR] Serper API: {e}")
+        return []
+
+
+def _analyze_news_for_risk(news_items: list, player_name: str) -> dict:
+    """
+    Analiza noticias para detectar lesiones, restricciones, etc.
+
+    Returns:
+        Dict con status, injury_report, minutes_restriction, risk_level
+    """
+    # Keywords para detectar problemas
+    injury_keywords = ["injury", "injured", "hurt", "pain", "sore", "sprain", "strain",
+                       "out", "miss", "sideline", "surgery", "rehab"]
+    questionable_keywords = ["questionable", "doubtful", "game-time", "uncertain", "day-to-day"]
+    rest_keywords = ["rest", "load management", "dnp", "sit out", "night off"]
+    restriction_keywords = ["minutes restriction", "limited minutes", "minute limit",
+                           "pitch count", "ramp up"]
+    positive_keywords = ["cleared", "full practice", "no restrictions", "healthy",
+                        "ready to play", "available", "probable"]
+
+    all_text = " ".join([
+        f"{item.get('title', '')} {item.get('snippet', '')}".lower()
+        for item in news_items
+    ])
+
+    # Detectar status
+    status = "ACTIVE"
+    injury_report = None
+    minutes_restriction = None
+    risk_level = "LOW"
+
+    # Buscar indicadores negativos
+    has_injury = any(kw in all_text for kw in injury_keywords)
+    has_questionable = any(kw in all_text for kw in questionable_keywords)
+    has_rest = any(kw in all_text for kw in rest_keywords)
+    has_restriction = any(kw in all_text for kw in restriction_keywords)
+    has_positive = any(kw in all_text for kw in positive_keywords)
+
+    if "out" in all_text and player_name.lower().split()[0] in all_text:
+        status = "OUT"
+        risk_level = "CRITICAL"
+    elif has_questionable:
+        status = "QUESTIONABLE"
+        risk_level = "HIGH"
+    elif has_injury or has_rest:
+        status = "PROBABLE"
+        risk_level = "MEDIUM"
+    elif has_positive:
+        status = "ACTIVE"
+        risk_level = "LOW"
+
+    # Extraer detalles de lesión
+    if has_injury:
+        for item in news_items:
+            snippet = item.get("snippet", "").lower()
+            if any(kw in snippet for kw in injury_keywords):
+                injury_report = item.get("snippet", "")[:200]
+                break
+
+    # Extraer restricción de minutos
+    if has_restriction:
+        for item in news_items:
+            snippet = item.get("snippet", "").lower()
+            if any(kw in snippet for kw in restriction_keywords):
+                minutes_restriction = item.get("snippet", "")[:150]
+                break
+
+    return {
+        "status": status,
+        "injury_report": injury_report,
+        "minutes_restriction": minutes_restriction,
+        "risk_level": risk_level
+    }
+
+
 def execute_search_news(player_name: str, search_keywords: list = None) -> dict:
     """
-    Busca noticias sobre un jugador.
+    Busca noticias sobre un jugador usando Serper.dev API.
 
-    En producción, conectar con:
-    - Twitter API / X API
-    - ESPN API
-    - Rotowire / FantasyLabs
+    Si SERPER_API_KEY no está configurada, usa datos simulados como fallback.
     """
     print(f"  [TOOL] Buscando noticias de: {player_name}")
 
-    # Simulación - En producción usar APIs reales
-    # Esta es una estructura de datos de ejemplo
+    # Construir query de búsqueda
+    base_query = f"{player_name} NBA"
+    if search_keywords:
+        base_query += " " + " ".join(search_keywords)
+    else:
+        base_query += " injury status news today"
+
+    # Intentar búsqueda real con Serper
+    if SERPER_API_KEY:
+        print(f"  [SERPER] Query: {base_query}")
+        news_items = _search_serper(base_query, num_results=5)
+
+        if news_items:
+            # Analizar noticias para extraer info relevante
+            analysis = _analyze_news_for_risk(news_items, player_name)
+
+            return {
+                "player": player_name,
+                "status": analysis["status"],
+                "injury_report": analysis["injury_report"],
+                "minutes_restriction": analysis["minutes_restriction"],
+                "last_update": datetime.now().strftime("%Y-%m-%d"),
+                "recent_news": [item.get("snippet", "")[:200] for item in news_items[:3]],
+                "risk_level": analysis["risk_level"],
+                "source": "serper_api",
+                "raw_results": news_items
+            }
+        else:
+            print("  [SERPER] No results, falling back to simulated data")
+
+    # Fallback: datos simulados
+    print("  [FALLBACK] Usando datos simulados")
     simulated_news = {
         "LeBron James": {
             "status": "ACTIVE",
             "injury_report": None,
             "minutes_restriction": None,
-            "last_update": "2024-12-23",
+            "last_update": datetime.now().strftime("%Y-%m-%d"),
             "recent_news": [
                 "LeBron participó en entrenamiento completo",
                 "Sin restricciones de minutos reportadas"
@@ -189,7 +335,7 @@ def execute_search_news(player_name: str, search_keywords: list = None) -> dict:
             "status": "QUESTIONABLE",
             "injury_report": "Dolor en tobillo derecho",
             "minutes_restriction": "Posible límite de 28-30 minutos",
-            "last_update": "2024-12-23",
+            "last_update": datetime.now().strftime("%Y-%m-%d"),
             "recent_news": [
                 "Curry listado como QUESTIONABLE para el partido de hoy",
                 "Se evaluará en calentamiento"
@@ -200,7 +346,7 @@ def execute_search_news(player_name: str, search_keywords: list = None) -> dict:
             "status": "ACTIVE",
             "injury_report": None,
             "minutes_restriction": None,
-            "last_update": "2024-12-23",
+            "last_update": datetime.now().strftime("%Y-%m-%d"),
             "recent_news": [
                 "Giannis confirmado como titular",
                 "Regresa tras descanso programado"
@@ -215,27 +361,122 @@ def execute_search_news(player_name: str, search_keywords: list = None) -> dict:
         "minutes_restriction": None,
         "last_update": datetime.now().strftime("%Y-%m-%d"),
         "recent_news": ["Sin noticias recientes encontradas"],
-        "risk_level": "MEDIUM"
+        "risk_level": "MEDIUM",
+        "source": "simulated"
     }
 
     result = simulated_news.get(player_name, default_response)
     result["player"] = player_name
+    result["source"] = "simulated"
 
     return result
 
 
+TEAM_FULL_NAMES = {
+    "ATL": "Atlanta Hawks", "BOS": "Boston Celtics", "BKN": "Brooklyn Nets",
+    "CHA": "Charlotte Hornets", "CHI": "Chicago Bulls", "CLE": "Cleveland Cavaliers",
+    "DAL": "Dallas Mavericks", "DEN": "Denver Nuggets", "DET": "Detroit Pistons",
+    "GSW": "Golden State Warriors", "HOU": "Houston Rockets", "IND": "Indiana Pacers",
+    "LAC": "Los Angeles Clippers", "LAL": "Los Angeles Lakers", "MEM": "Memphis Grizzlies",
+    "MIA": "Miami Heat", "MIL": "Milwaukee Bucks", "MIN": "Minnesota Timberwolves",
+    "NOP": "New Orleans Pelicans", "NYK": "New York Knicks", "OKC": "Oklahoma City Thunder",
+    "ORL": "Orlando Magic", "PHI": "Philadelphia 76ers", "PHX": "Phoenix Suns",
+    "POR": "Portland Trail Blazers", "SAC": "Sacramento Kings", "SAS": "San Antonio Spurs",
+    "TOR": "Toronto Raptors", "UTA": "Utah Jazz", "WAS": "Washington Wizards"
+}
+
+
+def _parse_injury_report(news_items: list, team_name: str) -> dict:
+    """
+    Parsea noticias de lesiones para extraer jugadores OUT/DOUBTFUL/QUESTIONABLE.
+    """
+    out = []
+    doubtful = []
+    questionable = []
+    probable = []
+    key_player_status = {}
+
+    for item in news_items:
+        text = f"{item.get('title', '')} {item.get('snippet', '')}".lower()
+
+        # Buscar patrones de lesión
+        if "out" in text:
+            # Intentar extraer nombres de jugadores
+            words = text.split()
+            for i, word in enumerate(words):
+                if word == "out" and i > 0:
+                    # Nombre probable antes de "out"
+                    potential_name = " ".join(words[max(0,i-2):i]).title()
+                    if len(potential_name) > 3 and potential_name not in out:
+                        out.append(potential_name.strip(".,"))
+
+        if "questionable" in text or "game-time decision" in text:
+            words = text.split()
+            for i, word in enumerate(words):
+                if "questionable" in word and i > 0:
+                    potential_name = " ".join(words[max(0,i-2):i]).title()
+                    if len(potential_name) > 3 and potential_name not in questionable:
+                        questionable.append(potential_name.strip(".,"))
+
+        if "doubtful" in text:
+            words = text.split()
+            for i, word in enumerate(words):
+                if word == "doubtful" and i > 0:
+                    potential_name = " ".join(words[max(0,i-2):i]).title()
+                    if len(potential_name) > 3 and potential_name not in doubtful:
+                        doubtful.append(potential_name.strip(".,"))
+
+    return {
+        "out": out[:5],  # Limitar a 5
+        "doubtful": doubtful[:3],
+        "questionable": questionable[:5],
+        "probable": probable[:3],
+        "key_player_status": key_player_status
+    }
+
+
 def execute_check_lineup(team_abbrev: str) -> dict:
     """
-    Verifica el estado del lineup de un equipo.
+    Verifica el estado del lineup de un equipo usando Serper API.
 
-    En producción, conectar con:
-    - NBA Official API
-    - Rotowire injury reports
-    - ESPN fantasy
+    Busca injury reports en fuentes como Rotowire, ESPN, CBS Sports.
     """
     print(f"  [TOOL] Verificando lineup de: {team_abbrev}")
 
-    # Simulación
+    team_name = TEAM_FULL_NAMES.get(team_abbrev, team_abbrev)
+
+    # Intentar búsqueda real con Serper
+    if SERPER_API_KEY:
+        query = f"{team_name} injury report today NBA"
+        print(f"  [SERPER] Query: {query}")
+        news_items = _search_serper(query, num_results=5)
+
+        if news_items:
+            # Parsear injury report
+            injury_data = _parse_injury_report(news_items, team_name)
+
+            # Determinar impacto
+            usage_impact = "Información obtenida de fuentes reales"
+            if injury_data["out"]:
+                usage_impact = f"Jugadores OUT: {', '.join(injury_data['out'][:3])}"
+
+            return {
+                "team": team_name,
+                "team_abbrev": team_abbrev,
+                "out": injury_data["out"],
+                "doubtful": injury_data["doubtful"],
+                "questionable": injury_data["questionable"],
+                "probable": injury_data["probable"],
+                "key_player_status": injury_data["key_player_status"],
+                "usage_impact": usage_impact,
+                "source": "serper_api",
+                "raw_news": [item.get("snippet", "")[:150] for item in news_items[:3]]
+            }
+        else:
+            print("  [SERPER] No results, falling back to simulated data")
+
+    # Fallback: datos simulados
+    print("  [FALLBACK] Usando datos simulados")
     lineups = {
         "LAL": {
             "team": "Los Angeles Lakers",
@@ -275,15 +516,20 @@ def execute_check_lineup(team_abbrev: str) -> dict:
         }
     }
 
-    return lineups.get(team_abbrev, {
-        "team": team_abbrev,
+    result = lineups.get(team_abbrev, {
+        "team": team_name,
+        "team_abbrev": team_abbrev,
         "out": [],
         "doubtful": [],
         "questionable": [],
         "probable": [],
         "key_player_status": {},
-        "usage_impact": "Información no disponible"
+        "usage_impact": "Información no disponible",
+        "source": "simulated"
     })
+    result["source"] = "simulated"
+
+    return result
 
 
 def execute_get_player_stats(player_name: str, last_n_games: int = 10,

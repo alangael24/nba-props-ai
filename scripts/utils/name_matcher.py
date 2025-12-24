@@ -122,6 +122,39 @@ MANUAL_MAPPINGS = {
     # Jimmy Butler especial
     "jimmy butler": "Jimmy Butler",
     "jimmy butler iii": "Jimmy Butler",
+
+    # Más variaciones comunes de PrizePicks/DraftKings
+    "cam thomas": "Cameron Thomas",
+    "cameron thomas": "Cameron Thomas",
+    "cam johnson": "Cameron Johnson",
+    "cameron johnson": "Cameron Johnson",
+    "alex caruso": "Alex Caruso",
+    "tre jones": "Tre Jones",
+    "trey murphy iii": "Trey Murphy III",
+    "trey murphy": "Trey Murphy III",
+    "jalen williams": "Jalen Williams",
+    "j williams": "Jalen Williams",
+    "jonathan isaac": "Jonathan Isaac",
+    "mo bamba": "Mohamed Bamba",
+    "mohamed bamba": "Mohamed Bamba",
+    "scottie barnes": "Scottie Barnes",
+    "evan mobley": "Evan Mobley",
+    "cade cunningham": "Cade Cunningham",
+    "ant edwards": "Anthony Edwards",
+    "anthony edwards": "Anthony Edwards",
+    "ant man": "Anthony Edwards",
+    "luka garza": "Luka Garza",
+    "franz wagner": "Franz Wagner",
+
+    # Nombres con ' (apóstrofe)
+    "d'angelo russell": "D'Angelo Russell",
+    "dangelo russell": "D'Angelo Russell",
+
+    # Más Jr/III
+    "walker kessler": "Walker Kessler",
+    "jabari walker": "Jabari Walker",
+    "mark williams": "Mark Williams",
+    "jalen green": "Jalen Green",
 }
 
 
@@ -262,6 +295,54 @@ class PlayerNameMatcher:
         """Devuelve nombres que no se pudieron resolver (para logging/debugging)."""
         return self.unmatched
 
+    def find_best_match(self, player_name: str, candidates: list,
+                        threshold: int = 85) -> Optional[str]:
+        """
+        Encuentra el mejor match para un nombre en una lista de candidatos.
+
+        Útil para matching contra listas dinámicas (ej: props de PrizePicks).
+
+        Args:
+            player_name: Nombre a buscar
+            candidates: Lista de nombres candidatos
+            threshold: Score mínimo de similarity (0-100)
+
+        Returns:
+            El mejor match si supera el threshold, None otherwise
+        """
+        if not player_name or not candidates:
+            return None
+
+        normalized_input = normalize_name(player_name)
+
+        # 1. Primero buscar exact match (normalizado)
+        for candidate in candidates:
+            if normalize_name(candidate) == normalized_input:
+                return candidate
+
+        # 2. Buscar en mapeos manuales
+        if normalized_input in MANUAL_MAPPINGS:
+            canonical = MANUAL_MAPPINGS[normalized_input]
+            for candidate in candidates:
+                if normalize_name(candidate) == normalize_name(canonical):
+                    return candidate
+
+        # 3. Fuzzy matching contra la lista de candidatos
+        if FUZZY_AVAILABLE:
+            # Normalizar candidatos para comparación
+            normalized_candidates = {normalize_name(c): c for c in candidates}
+
+            match = process.extractOne(
+                normalized_input,
+                list(normalized_candidates.keys()),
+                scorer=fuzz.ratio
+            )
+
+            if match and match[1] >= threshold:
+                return normalized_candidates[match[0]]
+
+        return None
+
     def add_manual_mapping(self, scraper_name: str, canonical_name: str):
         """Añade un mapeo manual en runtime."""
         normalized = normalize_name(scraper_name)
@@ -310,10 +391,12 @@ if __name__ == "__main__":
         "PJ Washington",
         "Shai Gilgeous-Alexander",
         "Shai Gilgeous Alexander",  # Sin guión
+        "Cam Thomas",  # Nombre corto
+        "Ant Edwards",  # Apodo
         "asdfasdf",  # Nombre inventado (no debería matchear)
     ]
 
-    print("\n=== Test de Name Matching ===\n")
+    print("\n=== Test de Name Matching (resolve) ===\n")
 
     for name in test_names:
         result = matcher.resolve(name)
@@ -323,3 +406,31 @@ if __name__ == "__main__":
             print(f"❌ '{name}' -> NO MATCH")
 
     print(f"\n⚠️ Nombres sin match: {matcher.get_unmatched_names()}")
+
+    # Test find_best_match (para PrizePicks/odds matching)
+    print("\n=== Test de find_best_match (odds matching) ===\n")
+
+    # Simular lista de props de PrizePicks
+    prizepicks_names = [
+        "Nicolas Claxton",
+        "P.J. Washington",
+        "Shai Gilgeous-Alexander",
+        "Anthony Edwards",
+        "Cameron Thomas",
+    ]
+
+    test_queries = [
+        "Nic Claxton",       # -> Nicolas Claxton
+        "PJ Washington",     # -> P.J. Washington
+        "Shai Alexander",    # -> Shai Gilgeous-Alexander
+        "Ant Edwards",       # -> Anthony Edwards
+        "Cam Thomas",        # -> Cameron Thomas
+        "Fake Player",       # -> None
+    ]
+
+    for query in test_queries:
+        match = matcher.find_best_match(query, prizepicks_names, threshold=85)
+        if match:
+            print(f"✅ '{query}' -> '{match}'")
+        else:
+            print(f"❌ '{query}' -> NO MATCH")

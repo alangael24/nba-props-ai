@@ -183,6 +183,146 @@ def get_opponent_stats() -> OpponentStats:
     return _opponent_stats
 
 
+class TeammateContext:
+    """
+    Carga contexto de compañeros de equipo.
+
+    Proporciona información sobre:
+    - Si las estrellas del equipo jugaron
+    - Usage boost esperado cuando faltan jugadores clave
+    """
+
+    def __init__(self, db_path: Path = None):
+        self.db_path = db_path or DB_PATH
+        self.context_cache: dict = {}  # (player_id, game_id) -> context
+        self.key_players_cache: dict = {}  # team_id -> key players info
+        self._load_data()
+
+    def _load_data(self):
+        """Carga el contexto de teammates desde la DB."""
+        try:
+            conn = sqlite3.connect(self.db_path)
+
+            # Cargar key players por equipo
+            key_players_df = pd.read_sql("""
+                SELECT * FROM team_key_players
+                WHERE season = '2024-25'
+            """, conn)
+
+            for _, row in key_players_df.iterrows():
+                self.key_players_cache[row["team_id"]] = {
+                    "star1_id": row["star1_player_id"],
+                    "star1_name": row["star1_name"],
+                    "star1_ppg": row["star1_ppg"],
+                    "star2_id": row["star2_player_id"],
+                    "star2_name": row["star2_name"],
+                    "star2_ppg": row["star2_ppg"],
+                    "star3_id": row["star3_player_id"],
+                    "star3_name": row["star3_name"],
+                    "star3_ppg": row["star3_ppg"],
+                    "pg_id": row["primary_pg_id"],
+                    "center_id": row["primary_center_id"]
+                }
+
+            # Cargar contexto de partidos
+            context_df = pd.read_sql("""
+                SELECT player_id, game_id,
+                       star1_available, star2_available, star3_available,
+                       total_stars_available, primary_pg_available,
+                       primary_center_available, usage_boost_expected
+                FROM teammate_context
+            """, conn)
+
+            for _, row in context_df.iterrows():
+                key = (row["player_id"], row["game_id"])
+                self.context_cache[key] = {
+                    "star1_available": row["star1_available"],
+                    "star2_available": row["star2_available"],
+                    "star3_available": row["star3_available"],
+                    "total_stars": row["total_stars_available"],
+                    "pg_available": row["primary_pg_available"],
+                    "center_available": row["primary_center_available"],
+                    "usage_boost": row["usage_boost_expected"]
+                }
+
+            conn.close()
+            print(f"TeammateContext: Cargados {len(self.context_cache)} contextos, {len(self.key_players_cache)} equipos")
+
+        except Exception as e:
+            print(f"Warning: Error cargando teammate context: {e}")
+
+    def get_context(self, player_id: int, game_id: str) -> dict:
+        """Obtiene contexto de compañeros para un jugador/partido específico."""
+        key = (player_id, game_id)
+        if key in self.context_cache:
+            return self.context_cache[key]
+
+        # Default: todos disponibles
+        return {
+            "star1_available": 1,
+            "star2_available": 1,
+            "star3_available": 1,
+            "total_stars": 3,
+            "pg_available": 1,
+            "center_available": 1,
+            "usage_boost": 0.0
+        }
+
+    def get_historical_teammate_stats(self, player_id: int, last_n_games: int = 10) -> dict:
+        """
+        Calcula estadísticas históricas de contexto de teammates.
+
+        Retorna promedios de disponibilidad de estrellas y usage boost.
+        """
+        try:
+            conn = sqlite3.connect(self.db_path)
+
+            df = pd.read_sql("""
+                SELECT star1_available, star2_available, star3_available,
+                       total_stars_available, usage_boost_expected
+                FROM teammate_context
+                WHERE player_id = ?
+                ORDER BY game_date DESC
+                LIMIT ?
+            """, conn, params=[int(player_id), last_n_games])
+
+            conn.close()
+
+            if df.empty:
+                return {
+                    "avg_stars_available": 3.0,
+                    "avg_usage_boost": 0.0,
+                    "games_without_star1": 0,
+                    "games_without_star2": 0
+                }
+
+            return {
+                "avg_stars_available": df["total_stars_available"].mean(),
+                "avg_usage_boost": df["usage_boost_expected"].mean(),
+                "games_without_star1": (df["star1_available"] == 0).sum(),
+                "games_without_star2": (df["star2_available"] == 0).sum()
+            }
+
+        except Exception:
+            return {
+                "avg_stars_available": 3.0,
+                "avg_usage_boost": 0.0,
+                "games_without_star1": 0,
+                "games_without_star2": 0
+            }
+
+
+# Singleton para teammate context
+_teammate_context: TeammateContext = None
+
+def get_teammate_context() -> TeammateContext:
+    """Obtiene instancia singleton de TeammateContext."""
+    global _teammate_context
+    if _teammate_context is None:
+        _teammate_context = TeammateContext()
+    return _teammate_context
+
+
 class ProbabilityCalibrator:
     """
     Calibra probabilidades usando Isotonic Regression.
@@ -286,13 +426,15 @@ class NBAPropsPredictor:
         # Cuantiles que usamos
         self.quantiles = [0.15, 0.50, 0.85]
 
-    def create_features(self, df: pd.DataFrame, include_opponent_stats: bool = True) -> pd.DataFrame:
+    def create_features(self, df: pd.DataFrame, include_opponent_stats: bool = True,
+                        include_teammate_context: bool = True) -> pd.DataFrame:
         """
         Crea features separadas para Minutos y Eficiencia.
 
         Args:
             df: DataFrame con game logs
             include_opponent_stats: Si True, incluye DvP y pace del oponente
+            include_teammate_context: Si True, incluye contexto de compañeros
         """
         df = df.copy()
         df = df.sort_values(["player_id", "game_date"])
@@ -305,6 +447,9 @@ class NBAPropsPredictor:
 
         # Cargar opponent stats si está habilitado
         opp_stats = get_opponent_stats() if include_opponent_stats else None
+
+        # Cargar teammate context si está habilitado
+        teammate_ctx = get_teammate_context() if include_teammate_context else None
 
         features = []
 
@@ -407,6 +552,21 @@ class NBAPropsPredictor:
                     opp_pace = 1.0
                     opp_def_rating = 1.0
 
+                # === TEAMMATE CONTEXT (disponibilidad de estrellas) ===
+                if teammate_ctx:
+                    game_id = row["game_id"]
+                    ctx = teammate_ctx.get_context(player_id, game_id)
+                    star1_available = ctx["star1_available"]
+                    star2_available = ctx["star2_available"]
+                    total_stars_available = ctx["total_stars"]
+                    usage_boost = ctx["usage_boost"]
+                else:
+                    # Defaults: todos disponibles
+                    star1_available = 1
+                    star2_available = 1
+                    total_stars_available = 3
+                    usage_boost = 0.0
+
                 # === CREAR FILA ===
                 feature_row = {
                     # IDs
@@ -457,6 +617,12 @@ class NBAPropsPredictor:
                     "opp_pace": opp_pace,
                     "opp_def_rating": opp_def_rating,
 
+                    # TEAMMATE CONTEXT (star availability)
+                    "star1_available": star1_available,
+                    "star2_available": star2_available,
+                    "total_stars_available": total_stars_available,
+                    "usage_boost_expected": usage_boost,
+
                     # TARGETS
                     "actual_min": row["min"],
                     "actual_pts": row["pts"],
@@ -480,7 +646,7 @@ class NBAPropsPredictor:
         ]
 
     def get_efficiency_features(self):
-        """Features para predecir EFICIENCIA (incluye opponent stats)."""
+        """Features para predecir EFICIENCIA (incluye opponent stats + teammate context)."""
         return [
             # PPM features
             "avg_ppm_5", "avg_ppm_10", "season_avg_ppm", "std_ppm",
@@ -495,7 +661,10 @@ class NBAPropsPredictor:
             "is_home",
             # Opponent stats (DvP + Pace + DefRating)
             "opp_dvp_pts", "opp_dvp_reb", "opp_dvp_ast",
-            "opp_pace", "opp_def_rating"
+            "opp_pace", "opp_def_rating",
+            # Teammate context (star availability)
+            "star1_available", "star2_available",
+            "total_stars_available", "usage_boost_expected"
         ]
 
     def _train_quantile_model(self, X_train, y_train, quantile: float,
@@ -684,7 +853,9 @@ class NBAPropsPredictor:
 
         ppm_features = [
             "avg_ppm_5", "avg_ppm_10", "season_avg_ppm", "std_ppm",
-            "ppm_trend", "vs_opp_ppm", "is_home"
+            "ppm_trend", "vs_opp_ppm", "is_home",
+            # Teammate context - boosts efficiency when stars are out
+            "star1_available", "star2_available", "usage_boost_expected"
         ]
 
         X_ppm = features_df[ppm_features].fillna(0)
@@ -713,7 +884,9 @@ class NBAPropsPredictor:
 
         rpm_features = [
             "avg_rpm_5", "avg_rpm_10", "season_avg_rpm", "std_rpm",
-            "rpm_trend", "vs_opp_rpm", "is_home"
+            "rpm_trend", "vs_opp_rpm", "is_home",
+            # Teammate context
+            "star1_available", "star2_available", "usage_boost_expected"
         ]
         X_rpm = features_df[rpm_features].fillna(0)
         y_rpm = features_df["actual_rpm"]
@@ -734,7 +907,9 @@ class NBAPropsPredictor:
 
         apm_features = [
             "avg_apm_5", "avg_apm_10", "season_avg_apm", "std_apm",
-            "apm_trend", "vs_opp_apm", "is_home"
+            "apm_trend", "vs_opp_apm", "is_home",
+            # Teammate context
+            "star1_available", "star2_available", "usage_boost_expected"
         ]
         X_apm = features_df[apm_features].fillna(0)
         y_apm = features_df["actual_apm"]
@@ -956,7 +1131,8 @@ class NBAPropsPredictor:
         self.minutes_features = joblib.load(MODELS_PATH / "minutes_features.joblib")
 
     def predict_player(self, player_name: str, opponent: str, is_home: bool = True,
-                       days_rest: int = None, minutes_override: float = None) -> dict:
+                       days_rest: int = None, minutes_override: float = None,
+                       star_out: bool = False, usage_boost: float = None) -> dict:
         """
         Predice estadísticas usando Minutos × Eficiencia con CUANTILES.
 
@@ -964,6 +1140,8 @@ class NBAPropsPredictor:
 
         Args:
             days_rest: Si es None, se calcula automáticamente de los datos.
+            star_out: Si True, indica que una estrella del equipo no juega (boost esperado)
+            usage_boost: Override manual del boost de usage (puntos extra esperados)
         """
         if self.model_minutes_p50 is None:
             self.load_models()
@@ -1093,18 +1271,55 @@ class NBAPropsPredictor:
             "opp_def_rating": opp_def_rating
         }
 
+        # Calcular teammate context features
+        if usage_boost is not None:
+            # Override manual
+            teammate_usage_boost = usage_boost
+            star1_avail = 0 if star_out else 1
+            star2_avail = 1
+        elif star_out:
+            # Una estrella está fuera - estimamos boost basado en histórico
+            teammate_ctx = get_teammate_context()
+            hist_stats = teammate_ctx.get_historical_teammate_stats(
+                player_df.iloc[0].get("player_id", 0), 10
+            )
+            teammate_usage_boost = hist_stats.get("avg_usage_boost", 4.0)  # ~4 pts boost típico
+            star1_avail = 0
+            star2_avail = 1
+        else:
+            # Todas las estrellas disponibles
+            teammate_usage_boost = 0.0
+            star1_avail = 1
+            star2_avail = 1
+
+        # Agregar teammate features a los diccionarios
+        ppm_features["star1_available"] = star1_avail
+        ppm_features["star2_available"] = star2_avail
+        ppm_features["usage_boost_expected"] = teammate_usage_boost
+
+        rpm_features["star1_available"] = star1_avail
+        rpm_features["star2_available"] = star2_avail
+        rpm_features["usage_boost_expected"] = teammate_usage_boost
+
+        apm_features["star1_available"] = star1_avail
+        apm_features["star2_available"] = star2_avail
+        apm_features["usage_boost_expected"] = teammate_usage_boost
+
         # Cada modelo usa sus propias features específicas
         ppm_cols = [
             "avg_ppm_5", "avg_ppm_10", "season_avg_ppm", "std_ppm",
-            "ppm_trend", "vs_opp_ppm", "is_home"
+            "ppm_trend", "vs_opp_ppm", "is_home",
+            "star1_available", "star2_available", "usage_boost_expected"
         ]
         rpm_cols = [
             "avg_rpm_5", "avg_rpm_10", "season_avg_rpm", "std_rpm",
-            "rpm_trend", "vs_opp_rpm", "is_home"
+            "rpm_trend", "vs_opp_rpm", "is_home",
+            "star1_available", "star2_available", "usage_boost_expected"
         ]
         apm_cols = [
             "avg_apm_5", "avg_apm_10", "season_avg_apm", "std_apm",
-            "apm_trend", "vs_opp_apm", "is_home"
+            "apm_trend", "vs_opp_apm", "is_home",
+            "star1_available", "star2_available", "usage_boost_expected"
         ]
 
         X_ppm = pd.DataFrame([ppm_features])[ppm_cols].fillna(0)
@@ -1156,6 +1371,12 @@ class NBAPropsPredictor:
                 "opp_dvp_ast": round(opp_dvp_ast, 1),
                 "opp_pace": round(opp_pace, 3),
                 "opp_def_rating": round(opp_def_rating, 3)
+            },
+            "teammate_context": {
+                "star1_available": star1_avail,
+                "star2_available": star2_avail,
+                "usage_boost_expected": round(teammate_usage_boost, 1),
+                "note": "⚠️ Star OUT - Expect boost" if star_out else "All stars available"
             },
             "minutes": {
                 "p15_floor": round(pred_min_p15, 1),
@@ -1357,6 +1578,10 @@ if __name__ == "__main__":
     parser.add_argument("--predict", type=str, help="Predecir jugador")
     parser.add_argument("--opponent", type=str, default="LAL", help="Oponente")
     parser.add_argument("--minutes", type=float, help="Override de minutos (si hay restricción)")
+    parser.add_argument("--star-out", action="store_true",
+                        help="Una estrella del equipo está OUT (boost esperado)")
+    parser.add_argument("--usage-boost", type=float,
+                        help="Override manual del usage boost (puntos extra esperados)")
 
     args = parser.parse_args()
 
@@ -1367,7 +1592,9 @@ if __name__ == "__main__":
     elif args.predict:
         result = predictor.predict_player(
             args.predict, args.opponent,
-            minutes_override=args.minutes
+            minutes_override=args.minutes,
+            star_out=args.star_out,
+            usage_boost=args.usage_boost
         )
         print("\n" + "="*50)
         print(f"PREDICCIÓN: {args.predict} vs {args.opponent}")

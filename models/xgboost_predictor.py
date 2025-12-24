@@ -261,42 +261,51 @@ class NBAPropsPredictor:
         """
         Calibra probabilidades empíricas basadas en datos históricos.
 
-        Para cada "posición de línea" relativa a los cuantiles,
-        calcula el % real de Over observado.
+        Para cada posición del ACTUAL relativo a los cuantiles predichos,
+        calcula el % real de Over observado en diferentes líneas hipotéticas.
         """
-        calibration = {
-            "below_p15": {"count": 0, "over_rate": 0.0},
-            "p15_to_p50": {"count": 0, "over_rate": 0.0},
-            "p50_to_p85": {"count": 0, "over_rate": 0.0},
-            "above_p85": {"count": 0, "over_rate": 0.0},
-        }
-
         n = len(actual)
 
-        for i in range(n):
-            # Usamos P50 como "línea" hipotética para calibración
-            line = pred_p50[i]
+        # Calibración 1: ¿Qué % de veces el actual supera cada cuantil?
+        actual_above_p15 = (actual > pred_p15).mean()
+        actual_above_p50 = (actual > pred_p50).mean()
+        actual_above_p85 = (actual > pred_p85).mean()
 
-            if line < pred_p15[i]:
-                bucket = "below_p15"
-            elif line < pred_p50[i]:
-                bucket = "p15_to_p50"
-            elif line < pred_p85[i]:
-                bucket = "p50_to_p85"
+        print(f"Calibración de cuantiles:")
+        print(f"  Actual > P15: {actual_above_p15*100:.1f}% (esperado ~85%)")
+        print(f"  Actual > P50: {actual_above_p50*100:.1f}% (esperado ~50%)")
+        print(f"  Actual > P85: {actual_above_p85*100:.1f}% (esperado ~15%)")
+
+        # Calibración 2: Para diferentes "líneas" relativas a cuantiles,
+        # ¿cuál es la tasa de Over real?
+        # Simulamos líneas en diferentes posiciones relativas a los cuantiles
+        calibration_points = []
+
+        for pct in [0.0, 0.25, 0.5, 0.75, 1.0]:
+            # Línea interpolada entre P15 y P85
+            if pct <= 0.5:
+                # Entre P15 y P50
+                hypothetical_line = pred_p15 + (pred_p50 - pred_p15) * (pct / 0.5)
             else:
-                bucket = "above_p85"
+                # Entre P50 y P85
+                hypothetical_line = pred_p50 + (pred_p85 - pred_p50) * ((pct - 0.5) / 0.5)
 
-            calibration[bucket]["count"] += 1
-            if actual[i] > line:
-                calibration[bucket]["over_rate"] += 1
+            over_rate = (actual > hypothetical_line).mean()
+            calibration_points.append({
+                "quantile_position": pct,  # 0=P15, 0.5=P50, 1.0=P85
+                "empirical_over_rate": over_rate,
+                "expected_over_rate": 0.85 - pct * 0.70  # 85% at P15, 15% at P85
+            })
 
-        # Calcular tasas
-        for bucket in calibration:
-            if calibration[bucket]["count"] > 0:
-                calibration[bucket]["over_rate"] /= calibration[bucket]["count"]
+        print(f"\nCalibración por posición de línea:")
+        for point in calibration_points:
+            pos = point["quantile_position"]
+            emp = point["empirical_over_rate"] * 100
+            exp = point["expected_over_rate"] * 100
+            label = "P15" if pos == 0 else "P50" if pos == 0.5 else "P85" if pos == 1.0 else f"{pos:.0%}"
+            print(f"  Línea @ {label}: {emp:.1f}% over (esperado {exp:.1f}%)")
 
-        # Calibración más detallada: bins de diferencia (actual - pred) / pred
-        # Crear 10 bins para interpolación isotónica
+        # Calibración 3: Bins de error relativo para isotonic regression
         diffs = (actual - pred_p50) / np.maximum(pred_p50, 1)
         bins = np.percentile(diffs, np.arange(0, 101, 10))
 
@@ -304,21 +313,21 @@ class NBAPropsPredictor:
         for i in range(len(bins) - 1):
             mask = (diffs >= bins[i]) & (diffs < bins[i + 1])
             if mask.sum() > 0:
-                # Para cada bin, ¿qué % superó P50?
                 over_rate = (actual[mask] > pred_p50[mask]).mean()
                 detailed_calibration.append({
-                    "diff_pct_low": bins[i],
-                    "diff_pct_high": bins[i + 1],
-                    "empirical_over_rate": over_rate,
-                    "count": mask.sum()
+                    "diff_pct_low": float(bins[i]),
+                    "diff_pct_high": float(bins[i + 1]),
+                    "empirical_over_rate": float(over_rate),
+                    "count": int(mask.sum())
                 })
 
-        print(f"Calibración por bucket:")
-        for bucket, data in calibration.items():
-            print(f"  {bucket}: {data['over_rate']*100:.1f}% over (n={data['count']})")
-
         return {
-            "buckets": calibration,
+            "quantile_calibration": {
+                "actual_above_p15": float(actual_above_p15),
+                "actual_above_p50": float(actual_above_p50),
+                "actual_above_p85": float(actual_above_p85),
+            },
+            "line_position_calibration": calibration_points,
             "detailed": detailed_calibration
         }
 

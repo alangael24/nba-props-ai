@@ -19,6 +19,16 @@ import pandas as pd
 
 # Agregar paths
 sys.path.insert(0, str(Path(__file__).parent.parent / "models"))
+sys.path.insert(0, str(Path(__file__).parent))
+
+# Name matcher para resolver nombres de jugadores
+try:
+    from utils.name_matcher import get_matcher, resolve_player_name
+    NAME_MATCHER_AVAILABLE = True
+except ImportError:
+    NAME_MATCHER_AVAILABLE = False
+    print("Warning: name_matcher not available. Using exact matching.")
+
 
 # nba_api para partidos del día
 try:
@@ -32,15 +42,147 @@ except ImportError:
 ODDS_API_KEY = os.environ.get("ODDS_API_KEY", "")
 ODDS_API_BASE = "https://api.the-odds-api.com/v4"
 
+# Cache global de spreads por partido
+GAME_SPREADS_CACHE: dict = {}  # (home_team, away_team) -> spread
+
+
+def fetch_game_spreads() -> dict:
+    """
+    Obtiene spreads de partidos de The Odds API.
+
+    Returns:
+        Dict mapeo de (home_team, away_team) -> spread (positivo = home favored)
+    """
+    global GAME_SPREADS_CACHE
+
+    if GAME_SPREADS_CACHE:
+        return GAME_SPREADS_CACHE
+
+    if not ODDS_API_KEY:
+        print("  ⚠️ ODDS_API_KEY no configurada para spreads")
+        return {}
+
+    client = httpx.Client(timeout=30.0)
+    spreads = {}
+
+    try:
+        # Obtener odds con spreads
+        odds_url = f"{ODDS_API_BASE}/sports/basketball_nba/odds"
+        response = client.get(odds_url, params={
+            "apiKey": ODDS_API_KEY,
+            "regions": "us",
+            "markets": "spreads",
+            "oddsFormat": "decimal"
+        })
+
+        if response.status_code != 200:
+            print(f"  Error obteniendo spreads: {response.status_code}")
+            return {}
+
+        events = response.json()
+        print(f"  📊 Spreads para {len(events)} partidos")
+
+        for event in events:
+            home_team = event.get("home_team", "")
+            away_team = event.get("away_team", "")
+            bookmakers = event.get("bookmakers", [])
+
+            # Tomar el primer bookmaker con spreads
+            for book in bookmakers:
+                markets = book.get("markets", [])
+                for market in markets:
+                    if market.get("key") == "spreads":
+                        outcomes = market.get("outcomes", [])
+                        for outcome in outcomes:
+                            team = outcome.get("name", "")
+                            spread = outcome.get("point", 0)
+
+                            # El spread es desde la perspectiva del equipo
+                            # Si home tiene -5, home is favored by 5
+                            if team == home_team:
+                                spreads[(home_team, away_team)] = spread
+                                break
+                        break
+                if (home_team, away_team) in spreads:
+                    break
+
+    except Exception as e:
+        print(f"  Error fetching spreads: {e}")
+    finally:
+        client.close()
+
+    GAME_SPREADS_CACHE = spreads
+    return spreads
+
+
+def get_game_spread(home_team: str, away_team: str) -> float:
+    """
+    Obtiene el spread para un partido específico.
+
+    Args:
+        home_team: Nombre completo del equipo local
+        away_team: Nombre completo del equipo visitante
+
+    Returns:
+        Spread (negativo = home favored, positivo = away favored)
+        0.0 si no se encuentra
+    """
+    spreads = fetch_game_spreads()
+    return spreads.get((home_team, away_team), 0.0)
+
+
+def estimate_blowout_risk(spread: float, is_favored: bool) -> float:
+    """
+    Estima el riesgo de blowout basado en el spread.
+
+    Args:
+        spread: Spread del partido (ej: -10 si el equipo está muy favorito)
+        is_favored: True si el jugador está en el equipo favorito
+
+    Returns:
+        Factor de ajuste de minutos (0.8-1.0)
+        - 1.0 = sin riesgo de blowout
+        - 0.8 = alto riesgo de minutos reducidos
+    """
+    abs_spread = abs(spread)
+
+    if abs_spread < 5:
+        # Partido cerrado, sin riesgo
+        return 1.0
+    elif abs_spread < 8:
+        # Spread moderado
+        if is_favored:
+            return 0.95  # Ligero riesgo
+        else:
+            return 0.92  # El underdog puede tener menos minutos si pierde mucho
+    elif abs_spread < 12:
+        # Spread grande
+        if is_favored:
+            return 0.90  # Riesgo moderado de blowout
+        else:
+            return 0.88
+    else:
+        # Spread muy grande (>12)
+        if is_favored:
+            return 0.85  # Alto riesgo de blowout
+        else:
+            return 0.82
+
+    return 1.0
+
 
 def fetch_real_odds_from_api() -> list:
     """
     Obtiene odds REALES de The Odds API.
     Requiere ODDS_API_KEY configurada.
+    Incluye spread para calcular riesgo de blowout.
     """
     if not ODDS_API_KEY:
         print("  ⚠️ ODDS_API_KEY no configurada")
         return []
+
+    # Pre-fetch spreads para todos los partidos
+    spreads = fetch_game_spreads()
 
     client = httpx.Client(timeout=30.0)
     all_props = []
@@ -147,6 +289,10 @@ def fetch_real_odds_from_api() -> list:
 
                                         if best_line:
                                             line_data = data["lines"][best_line]
+
+                                            # Obtener spread del partido
+                                            game_spread = spreads.get((home_team, away_team), 0.0)
+
                                             all_props.append({
                                                 "player": player,
                                                 "team": home_abbrev if player else away_abbrev,
@@ -157,7 +303,8 @@ def fetch_real_odds_from_api() -> list:
                                                 "line": best_line,
                                                 "over_odds": line_data.get("over", 1.91),
                                                 "under_odds": line_data.get("under", 1.91),
-                                                "source": book_name
+                                                "source": book_name,
+                                                "game_spread": game_spread
                                             })
 
                 except Exception as e:
@@ -576,6 +723,10 @@ def scan_for_value():
 
         for rp in real_props:
             player = rp["player"]
+            game_spread = rp.get("game_spread", 0.0)
+            home_team = rp.get("home_team", "")
+            away_team = rp.get("away_team", "")
+
             if player in seen_players:
                 # Ya existe, agregar stat
                 for p in props:
@@ -593,6 +744,9 @@ def scan_for_value():
                     "opponent": rp["opponent"],
                     "is_home": True,  # TODO: determinar correctamente
                     "source": rp.get("source", "API"),
+                    "game_spread": game_spread,
+                    "home_team": home_team,
+                    "away_team": away_team,
                     "props": {
                         rp["stat"]: {
                             "line": rp["line"],
@@ -614,12 +768,30 @@ def scan_for_value():
         from xgboost_predictor import NBAPropsPredictor
         predictor = NBAPropsPredictor()
 
+        # Inicializar name matcher si está disponible
+        name_matcher = get_matcher() if NAME_MATCHER_AVAILABLE else None
+        resolved_count = 0
+        unresolved_count = 0
+
         predictions = {}
 
         for prop in props:
-            player = prop["player"]
+            player_raw = prop["player"]
             opponent = prop["opponent"]
             is_home = prop.get("is_home", True)
+
+            # Resolver nombre usando fuzzy matching
+            if name_matcher:
+                resolved = name_matcher.resolve(player_raw)
+                if resolved:
+                    player = resolved[0]  # Nombre canónico
+                    if player != player_raw:
+                        resolved_count += 1
+                else:
+                    player = player_raw
+                    unresolved_count += 1
+            else:
+                player = player_raw
 
             # Evitar predecir el mismo jugador múltiples veces
             if player in predictions:
@@ -627,7 +799,17 @@ def scan_for_value():
 
             source = prop.get("source", "")
             source_tag = f" [{source}]" if source else ""
-            print(f"\nAnalizando: {player} vs {opponent}{source_tag}")
+
+            # Obtener spread y calcular riesgo de blowout
+            game_spread = prop.get("game_spread", 0.0)
+            is_favored = game_spread < 0 if is_home else game_spread > 0
+            blowout_factor = estimate_blowout_risk(game_spread, is_favored)
+
+            spread_info = ""
+            if abs(game_spread) >= 8:
+                spread_info = f" [Spread: {game_spread:+.1f}, Blowout Risk: {(1-blowout_factor)*100:.0f}%]"
+
+            print(f"\nAnalizando: {player} vs {opponent}{source_tag}{spread_info}")
 
             try:
                 result = predictor.predict_player(player, opponent, is_home=is_home)
@@ -652,24 +834,31 @@ def scan_for_value():
                     if not line:
                         continue
 
+                    # Usar cuantiles reales para todas las stats
                     if stat == "pts":
-                        # Usar cuantiles para puntos
                         p15 = result["predictions_pts"]["p15_floor"]
                         p50 = result["predictions_pts"]["p50_median"]
                         p85 = result["predictions_pts"]["p85_ceiling"]
-                        prob_over = predictor.calculate_probability_from_quantiles(
-                            p15, p50, p85, line
-                        )
-                    else:
-                        # Para reb/ast usar aproximación basada en mediana
-                        diff = pred_value - line
-                        prob_over = 0.5 + (diff / (abs(diff) + 2)) * 0.3
+                    elif stat == "reb":
+                        p15 = result["predictions_reb"]["p15_floor"]
+                        p50 = result["predictions_reb"]["p50_median"]
+                        p85 = result["predictions_reb"]["p85_ceiling"]
+                    elif stat == "ast":
+                        p15 = result["predictions_ast"]["p15_floor"]
+                        p50 = result["predictions_ast"]["p50_median"]
+                        p85 = result["predictions_ast"]["p85_ceiling"]
+
+                    prob_over = predictor.calculate_probability_from_quantiles(
+                        p15, p50, p85, line
+                    )
 
                     predictions[player][stat] = {
                         "prediction": pred_value,
                         "prob_over": prob_over,
-                        "p15": result["predictions_pts"]["p15_floor"] if stat == "pts" else None,
-                        "p85": result["predictions_pts"]["p85_ceiling"] if stat == "pts" else None
+                        "p15": p15,
+                        "p85": p85,
+                        "blowout_factor": blowout_factor,
+                        "game_spread": game_spread
                     }
 
             except Exception as e:
@@ -719,7 +908,18 @@ def scan_for_value():
             prob = f"{bet['model_probability']:.1f}"
             edge = f"{bet['edge']:.1f}"
             ev = f"{bet['ev']:.1f}"
-            print(f"\n#{i} {bet['player']} - {bet['stat'].upper()} {bet['bet_type']}")
+
+            # Verificar riesgo de blowout desde predictions
+            player = bet['player']
+            stat = bet['stat']
+            blowout_warning = ""
+            if player in predictions and stat in predictions[player]:
+                blowout_factor = predictions[player][stat].get("blowout_factor", 1.0)
+                game_spread = predictions[player][stat].get("game_spread", 0.0)
+                if blowout_factor < 0.92:
+                    blowout_warning = f" ⚠️ BLOWOUT RISK (spread: {game_spread:+.1f})"
+
+            print(f"\n#{i} {bet['player']} - {bet['stat'].upper()} {bet['bet_type']}{blowout_warning}")
             print(f"   Línea: {bet['line']} @ {bet['odds']}")
             print(f"   Predicción: {pred} | Prob: {prob}%")
             print(f"   Edge: +{edge}% | EV: +{ev}%")

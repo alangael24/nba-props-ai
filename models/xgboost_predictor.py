@@ -19,10 +19,228 @@ import joblib
 
 from sklearn.model_selection import train_test_split, cross_val_score
 from sklearn.metrics import mean_absolute_error, mean_squared_error
+from sklearn.isotonic import IsotonicRegression
 import xgboost as xgb
 
 DB_PATH = Path(__file__).parent.parent / "data" / "nba_props.db"
 MODELS_PATH = Path(__file__).parent
+
+
+class OpponentStats:
+    """
+    Carga y cachea estadísticas de oponentes para usar como features.
+
+    Incluye:
+    - DvP (Defense vs Position): Cuánto permite cada equipo a cada posición
+    - Pace proxy: Ritmo de juego aproximado del oponente
+    - Defensive rating proxy: Eficiencia defensiva del oponente
+    """
+
+    def __init__(self, db_path: Path = None):
+        self.db_path = db_path or DB_PATH
+        self.dvp_cache: dict = {}
+        self.team_stats_cache: dict = {}
+        self._load_data()
+
+    def _load_data(self):
+        """Carga DvP y calcula stats de equipos."""
+        try:
+            conn = sqlite3.connect(self.db_path)
+
+            # Cargar DvP
+            dvp_df = pd.read_sql("""
+                SELECT team_abbrev, position, pts_allowed_avg, reb_allowed_avg,
+                       ast_allowed_avg, games_sample
+                FROM defense_vs_position
+                WHERE season = '2024-25'
+            """, conn)
+
+            for _, row in dvp_df.iterrows():
+                key = (row["team_abbrev"], row["position"])
+                self.dvp_cache[key] = {
+                    "pts_allowed": row["pts_allowed_avg"],
+                    "reb_allowed": row["reb_allowed_avg"],
+                    "ast_allowed": row["ast_allowed_avg"],
+                    "games": row["games_sample"]
+                }
+
+            # Calcular stats de equipos (pace proxy, def rating proxy)
+            team_stats = pd.read_sql("""
+                SELECT
+                    opponent_abbrev as team,
+                    AVG(pts) as opp_pts_allowed,
+                    COUNT(*) as games,
+                    AVG(min) as avg_game_min
+                FROM player_game_logs
+                WHERE opponent_abbrev IS NOT NULL
+                AND min > 0
+                GROUP BY opponent_abbrev
+                HAVING games >= 50
+            """, conn)
+
+            # También calculamos cuántos puntos anota el oponente (su ofensiva)
+            team_offense = pd.read_sql("""
+                SELECT
+                    t.abbreviation as team,
+                    AVG(g.pts) as team_pts_scored
+                FROM player_game_logs g
+                JOIN players p ON g.player_id = p.player_id
+                JOIN teams t ON p.team_id = t.team_id
+                WHERE g.min > 0
+                GROUP BY t.abbreviation
+            """, conn)
+
+            conn.close()
+
+            # Combinar y calcular proxies
+            if not team_stats.empty:
+                # Pace proxy: más puntos permitidos = más ritmo
+                mean_pts = team_stats["opp_pts_allowed"].mean()
+                std_pts = team_stats["opp_pts_allowed"].std()
+
+                for _, row in team_stats.iterrows():
+                    team = row["team"]
+                    pts_allowed = row["opp_pts_allowed"]
+
+                    # Pace proxy normalizado (z-score, luego a escala 0.8-1.2)
+                    pace_z = (pts_allowed - mean_pts) / std_pts if std_pts > 0 else 0
+                    pace_factor = 1.0 + (pace_z * 0.1)  # ±10% around baseline
+                    pace_factor = max(0.8, min(1.2, pace_factor))
+
+                    # Def rating proxy: más puntos permitidos = peor defensa
+                    def_rating = pts_allowed / mean_pts if mean_pts > 0 else 1.0
+
+                    self.team_stats_cache[team] = {
+                        "pace_factor": pace_factor,
+                        "def_rating": def_rating,
+                        "pts_allowed_avg": pts_allowed
+                    }
+
+            print(f"OpponentStats: Cargados {len(self.dvp_cache)} DvP entries, {len(self.team_stats_cache)} team stats")
+
+        except Exception as e:
+            print(f"Warning: Error cargando opponent stats: {e}")
+
+    def get_dvp(self, team_abbrev: str, position: str) -> dict:
+        """Obtiene DvP para equipo/posición."""
+        key = (team_abbrev, position)
+        if key in self.dvp_cache:
+            return self.dvp_cache[key]
+
+        # Fallback: promedio de todas las posiciones del equipo
+        team_dvps = [v for k, v in self.dvp_cache.items() if k[0] == team_abbrev]
+        if team_dvps:
+            return {
+                "pts_allowed": np.mean([d["pts_allowed"] for d in team_dvps]),
+                "reb_allowed": np.mean([d["reb_allowed"] for d in team_dvps]),
+                "ast_allowed": np.mean([d["ast_allowed"] for d in team_dvps]),
+                "games": 0
+            }
+
+        # Default neutral
+        return {"pts_allowed": 15.0, "reb_allowed": 5.0, "ast_allowed": 3.0, "games": 0}
+
+    def get_team_stats(self, team_abbrev: str) -> dict:
+        """Obtiene pace y def_rating para un equipo."""
+        if team_abbrev in self.team_stats_cache:
+            return self.team_stats_cache[team_abbrev]
+
+        # Default neutral
+        return {"pace_factor": 1.0, "def_rating": 1.0, "pts_allowed_avg": 100.0}
+
+    def infer_position(self, player_df: pd.DataFrame) -> str:
+        """Infiere posición del jugador basado en sus stats."""
+        if player_df.empty or player_df["min"].mean() < 1:
+            return "SF"  # Default
+
+        avg_ast = player_df["ast"].mean()
+        avg_reb = player_df["reb"].mean()
+        avg_min = player_df["min"].mean()
+
+        apm = avg_ast / avg_min if avg_min > 0 else 0
+        rpm = avg_reb / avg_min if avg_min > 0 else 0
+
+        if apm > 0.25:
+            return "PG"
+        elif rpm > 0.30 and apm < 0.10:
+            return "C"
+        elif rpm > 0.25:
+            return "PF"
+        elif apm > 0.15:
+            return "SG"
+        else:
+            return "SF"
+
+
+# Singleton para reusar
+_opponent_stats: OpponentStats = None
+
+def get_opponent_stats() -> OpponentStats:
+    """Obtiene instancia singleton de OpponentStats."""
+    global _opponent_stats
+    if _opponent_stats is None:
+        _opponent_stats = OpponentStats()
+    return _opponent_stats
+
+
+class ProbabilityCalibrator:
+    """
+    Calibra probabilidades usando Isotonic Regression.
+
+    Problema: Si el modelo dice "60% prob de Over", pero históricamente
+    cuando dice 60% solo acierta el 52%, tenemos un sesgo.
+
+    Solución: Usar regresión isotónica para mapear probabilidades
+    crudas a probabilidades calibradas basadas en datos históricos.
+    """
+
+    def __init__(self):
+        self.iso_reg = IsotonicRegression(out_of_bounds='clip')
+        self.is_fitted = False
+
+    def fit(self, predicted_probs: np.ndarray, actual_outcomes: np.ndarray):
+        """
+        Ajusta el calibrador con datos históricos.
+
+        Args:
+            predicted_probs: Probabilidades crudas del modelo (0-1)
+            actual_outcomes: 1 si fue Over, 0 si fue Under
+        """
+        # Necesitamos suficientes datos para calibrar
+        if len(predicted_probs) < 100:
+            print("  ⚠️ Pocos datos para calibración isotónica (<100)")
+            return
+
+        self.iso_reg.fit(predicted_probs, actual_outcomes)
+        self.is_fitted = True
+
+        # Mostrar estadísticas de calibración
+        calibrated = self.iso_reg.predict(predicted_probs)
+        print(f"  Calibración isotónica ajustada:")
+        print(f"    - Datos: {len(predicted_probs)}")
+        print(f"    - Prob cruda rango: [{predicted_probs.min():.2f}, {predicted_probs.max():.2f}]")
+        print(f"    - Prob calibrada rango: [{calibrated.min():.2f}, {calibrated.max():.2f}]")
+
+    def calibrate(self, raw_prob: float) -> float:
+        """
+        Calibra una probabilidad cruda.
+
+        Args:
+            raw_prob: Probabilidad del modelo (0-1)
+
+        Returns:
+            Probabilidad calibrada
+        """
+        if not self.is_fitted:
+            return raw_prob
+
+        return float(self.iso_reg.predict([raw_prob])[0])
+
+    def calibrate_batch(self, raw_probs: np.ndarray) -> np.ndarray:
+        """Calibra un array de probabilidades."""
+        if not self.is_fitted:
+            return raw_probs
+        return self.iso_reg.predict(raw_probs)
 
 
 class NBAPropsPredictor:
@@ -63,13 +281,18 @@ class NBAPropsPredictor:
 
         # Calibración de probabilidades
         self.calibration_curve = None
+        self.probability_calibrator = ProbabilityCalibrator()
 
         # Cuantiles que usamos
         self.quantiles = [0.15, 0.50, 0.85]
 
-    def create_features(self, df: pd.DataFrame) -> pd.DataFrame:
+    def create_features(self, df: pd.DataFrame, include_opponent_stats: bool = True) -> pd.DataFrame:
         """
         Crea features separadas para Minutos y Eficiencia.
+
+        Args:
+            df: DataFrame con game logs
+            include_opponent_stats: Si True, incluye DvP y pace del oponente
         """
         df = df.copy()
         df = df.sort_values(["player_id", "game_date"])
@@ -80,6 +303,9 @@ class NBAPropsPredictor:
         df["rpm"] = df["reb"] / df["min"].replace(0, 1)  # Rebounds per minute
         df["apm"] = df["ast"] / df["min"].replace(0, 1)  # Assists per minute
 
+        # Cargar opponent stats si está habilitado
+        opp_stats = get_opponent_stats() if include_opponent_stats else None
+
         features = []
 
         for player_id in df["player_id"].unique():
@@ -87,6 +313,9 @@ class NBAPropsPredictor:
 
             if len(player_df) < 10:
                 continue
+
+            # Inferir posición del jugador para DvP lookup
+            player_position = opp_stats.infer_position(player_df) if opp_stats else "SF"
 
             for i in range(10, len(player_df)):
                 row = player_df.iloc[i]
@@ -160,6 +389,24 @@ class NBAPropsPredictor:
                 rpm_trend = avg_rpm_5 - avg_rpm_10
                 apm_trend = avg_apm_5 - avg_apm_10
 
+                # === OPPONENT STATS (DvP, Pace, Def Rating) ===
+                if opp_stats:
+                    dvp = opp_stats.get_dvp(opponent, player_position)
+                    team_stats = opp_stats.get_team_stats(opponent)
+
+                    opp_dvp_pts = dvp["pts_allowed"]
+                    opp_dvp_reb = dvp["reb_allowed"]
+                    opp_dvp_ast = dvp["ast_allowed"]
+                    opp_pace = team_stats["pace_factor"]
+                    opp_def_rating = team_stats["def_rating"]
+                else:
+                    # Defaults neutrales
+                    opp_dvp_pts = 15.0
+                    opp_dvp_reb = 5.0
+                    opp_dvp_ast = 3.0
+                    opp_pace = 1.0
+                    opp_def_rating = 1.0
+
                 # === CREAR FILA ===
                 feature_row = {
                     # IDs
@@ -203,6 +450,13 @@ class NBAPropsPredictor:
                     "apm_trend": apm_trend,
                     "vs_opp_apm": vs_opp_apm,
 
+                    # OPPONENT STATS (DvP + Pace + DefRating)
+                    "opp_dvp_pts": opp_dvp_pts,
+                    "opp_dvp_reb": opp_dvp_reb,
+                    "opp_dvp_ast": opp_dvp_ast,
+                    "opp_pace": opp_pace,
+                    "opp_def_rating": opp_def_rating,
+
                     # TARGETS
                     "actual_min": row["min"],
                     "actual_pts": row["pts"],
@@ -226,7 +480,7 @@ class NBAPropsPredictor:
         ]
 
     def get_efficiency_features(self):
-        """Features para predecir EFICIENCIA."""
+        """Features para predecir EFICIENCIA (incluye opponent stats)."""
         return [
             # PPM features
             "avg_ppm_5", "avg_ppm_10", "season_avg_ppm", "std_ppm",
@@ -238,7 +492,10 @@ class NBAPropsPredictor:
             "avg_apm_5", "avg_apm_10", "season_avg_apm", "std_apm",
             "apm_trend", "vs_opp_apm",
             # Context
-            "is_home"
+            "is_home",
+            # Opponent stats (DvP + Pace + DefRating)
+            "opp_dvp_pts", "opp_dvp_reb", "opp_dvp_ast",
+            "opp_pace", "opp_def_rating"
         ]
 
     def _train_quantile_model(self, X_train, y_train, quantile: float,
@@ -567,6 +824,39 @@ class NBAPropsPredictor:
         )
         self.calibration_curve = calibration_data
 
+        # Calibración isotónica para ajustar probabilidades
+        print("\nAjustando calibración isotónica...")
+
+        # Generar probabilidades crudas para cada predicción del test set
+        # Usamos múltiples líneas hipotéticas para tener más datos de calibración
+        raw_probs = []
+        actual_outcomes = []
+
+        for i in range(len(actual_pts)):
+            # Probamos varias líneas alrededor de P50 para cada predicción
+            for line_offset in [-3, -1.5, 0, 1.5, 3]:
+                hypothetical_line = final_pred_pts_p50[i] + line_offset
+                if hypothetical_line <= 0:
+                    continue
+
+                # Probabilidad cruda de over
+                raw_prob = self.calculate_probability_from_quantiles(
+                    final_pred_pts_p15[i],
+                    final_pred_pts_p50[i],
+                    final_pred_pts_p85[i],
+                    hypothetical_line
+                )
+                raw_probs.append(raw_prob)
+
+                # Outcome real: ¿el actual superó la línea hipotética?
+                actual_over = 1 if actual_pts.values[i] > hypothetical_line else 0
+                actual_outcomes.append(actual_over)
+
+        raw_probs = np.array(raw_probs)
+        actual_outcomes = np.array(actual_outcomes)
+
+        self.probability_calibrator.fit(raw_probs, actual_outcomes)
+
         # ============================================================
         # RE-ENTRENAR CON TODOS LOS DATOS PARA PRODUCCIÓN
         # ============================================================
@@ -625,6 +915,7 @@ class NBAPropsPredictor:
 
         # Calibración y features
         joblib.dump(self.calibration_curve, MODELS_PATH / "calibration_curve.joblib")
+        joblib.dump(self.probability_calibrator, MODELS_PATH / "probability_calibrator.joblib")
         joblib.dump(self.minutes_features, MODELS_PATH / "minutes_features.joblib")
 
         print("Modelos guardados correctamente.")
@@ -656,6 +947,12 @@ class NBAPropsPredictor:
             self.calibration_curve = joblib.load(MODELS_PATH / "calibration_curve.joblib")
         except FileNotFoundError:
             self.calibration_curve = None
+
+        try:
+            self.probability_calibrator = joblib.load(MODELS_PATH / "probability_calibrator.joblib")
+        except FileNotFoundError:
+            self.probability_calibrator = ProbabilityCalibrator()
+
         self.minutes_features = joblib.load(MODELS_PATH / "minutes_features.joblib")
 
     def predict_player(self, player_name: str, opponent: str, is_home: bool = True,
@@ -705,6 +1002,18 @@ class NBAPropsPredictor:
         last_10 = player_df.head(10)
         vs_opp = player_df[player_df["opponent_abbrev"] == opponent]
 
+        # Obtener opponent stats (DvP, pace, def_rating)
+        opp_stats = get_opponent_stats()
+        player_position = opp_stats.infer_position(player_df)
+        dvp = opp_stats.get_dvp(opponent, player_position)
+        team_stats = opp_stats.get_team_stats(opponent)
+
+        opp_dvp_pts = dvp["pts_allowed"]
+        opp_dvp_reb = dvp["reb_allowed"]
+        opp_dvp_ast = dvp["ast_allowed"]
+        opp_pace = team_stats["pace_factor"]
+        opp_def_rating = team_stats["def_rating"]
+
         # Features para MINUTOS
         similar_games = player_df[player_df["is_home"] == (1 if is_home else 0)]
 
@@ -735,7 +1044,7 @@ class NBAPropsPredictor:
             pred_min_p85 = self.model_minutes_p85.predict(X_min)[0]
             minutes_source = "MODEL"
 
-        # Features para EFICIENCIA
+        # Features para EFICIENCIA (incluye opponent stats)
         ppm_features = {
             "avg_ppm_5": last_5["ppm"].mean(),
             "avg_ppm_10": last_10["ppm"].mean(),
@@ -743,7 +1052,13 @@ class NBAPropsPredictor:
             "std_ppm": player_df["ppm"].std(),
             "ppm_trend": last_5["ppm"].mean() - last_10["ppm"].mean(),
             "vs_opp_ppm": vs_opp["ppm"].mean() if len(vs_opp) > 0 else player_df["ppm"].mean(),
-            "is_home": 1 if is_home else 0
+            "is_home": 1 if is_home else 0,
+            # Opponent stats
+            "opp_dvp_pts": opp_dvp_pts,
+            "opp_dvp_reb": opp_dvp_reb,
+            "opp_dvp_ast": opp_dvp_ast,
+            "opp_pace": opp_pace,
+            "opp_def_rating": opp_def_rating
         }
 
         rpm_features = {
@@ -753,7 +1068,13 @@ class NBAPropsPredictor:
             "std_rpm": player_df["rpm"].std(),
             "rpm_trend": last_5["rpm"].mean() - last_10["rpm"].mean(),
             "vs_opp_rpm": vs_opp["rpm"].mean() if len(vs_opp) > 0 else player_df["rpm"].mean(),
-            "is_home": 1 if is_home else 0
+            "is_home": 1 if is_home else 0,
+            # Opponent stats
+            "opp_dvp_pts": opp_dvp_pts,
+            "opp_dvp_reb": opp_dvp_reb,
+            "opp_dvp_ast": opp_dvp_ast,
+            "opp_pace": opp_pace,
+            "opp_def_rating": opp_def_rating
         }
 
         apm_features = {
@@ -763,12 +1084,32 @@ class NBAPropsPredictor:
             "std_apm": player_df["apm"].std(),
             "apm_trend": last_5["apm"].mean() - last_10["apm"].mean(),
             "vs_opp_apm": vs_opp["apm"].mean() if len(vs_opp) > 0 else player_df["apm"].mean(),
-            "is_home": 1 if is_home else 0
+            "is_home": 1 if is_home else 0,
+            # Opponent stats
+            "opp_dvp_pts": opp_dvp_pts,
+            "opp_dvp_reb": opp_dvp_reb,
+            "opp_dvp_ast": opp_dvp_ast,
+            "opp_pace": opp_pace,
+            "opp_def_rating": opp_def_rating
         }
 
-        X_ppm = pd.DataFrame([ppm_features]).fillna(0)
-        X_rpm = pd.DataFrame([rpm_features]).fillna(0)
-        X_apm = pd.DataFrame([apm_features]).fillna(0)
+        # Cada modelo usa sus propias features específicas
+        ppm_cols = [
+            "avg_ppm_5", "avg_ppm_10", "season_avg_ppm", "std_ppm",
+            "ppm_trend", "vs_opp_ppm", "is_home"
+        ]
+        rpm_cols = [
+            "avg_rpm_5", "avg_rpm_10", "season_avg_rpm", "std_rpm",
+            "rpm_trend", "vs_opp_rpm", "is_home"
+        ]
+        apm_cols = [
+            "avg_apm_5", "avg_apm_10", "season_avg_apm", "std_apm",
+            "apm_trend", "vs_opp_apm", "is_home"
+        ]
+
+        X_ppm = pd.DataFrame([ppm_features])[ppm_cols].fillna(0)
+        X_rpm = pd.DataFrame([rpm_features])[rpm_cols].fillna(0)
+        X_apm = pd.DataFrame([apm_features])[apm_cols].fillna(0)
 
         # Predecir PPM (con cuantiles)
         pred_ppm_p15 = self.model_ppm_p15.predict(X_ppm)[0]
@@ -808,6 +1149,14 @@ class NBAPropsPredictor:
             "is_home": is_home,
             "days_rest": days_rest,
             "model_type": "QUANTILE REGRESSION",
+            "matchup_info": {
+                "player_position": player_position,
+                "opp_dvp_pts": round(opp_dvp_pts, 1),
+                "opp_dvp_reb": round(opp_dvp_reb, 1),
+                "opp_dvp_ast": round(opp_dvp_ast, 1),
+                "opp_pace": round(opp_pace, 3),
+                "opp_def_rating": round(opp_def_rating, 3)
+            },
             "minutes": {
                 "p15_floor": round(pred_min_p15, 1),
                 "p50_median": round(pred_min_p50, 1),
@@ -851,31 +1200,56 @@ class NBAPropsPredictor:
         }
 
     def calculate_probability_from_quantiles(self, p15: float, p50: float,
-                                              p85: float, line: float) -> float:
+                                              p85: float, line: float,
+                                              calibrate: bool = True) -> float:
         """
         Calcula probabilidad de Over usando cuantiles en lugar de distribución normal.
 
         Usa interpolación lineal entre cuantiles conocidos.
+        Si calibrate=True, aplica calibración isotónica.
+
+        Args:
+            p15: Cuantil 15 (piso)
+            p50: Cuantil 50 (mediana)
+            p85: Cuantil 85 (techo)
+            line: Línea de la apuesta
+            calibrate: Si True, calibra la probabilidad con isotonic regression
         """
         # Si la línea está por debajo del piso, ~95%+ de Over
         if line <= p15:
-            return 0.92
+            raw_prob = 0.92
 
         # Si la línea está por encima del techo, ~5% de Over
-        if line >= p85:
-            return 0.08
+        elif line >= p85:
+            raw_prob = 0.08
 
         # Si está entre P15 y P50
-        if line <= p50:
+        elif line <= p50:
             # Interpolar entre 85% y 50%
             ratio = (line - p15) / (p50 - p15) if (p50 - p15) > 0 else 0.5
-            return 0.85 - (ratio * 0.35)  # 85% -> 50%
+            raw_prob = 0.85 - (ratio * 0.35)  # 85% -> 50%
 
         # Si está entre P50 y P85
         else:
             # Interpolar entre 50% y 15%
             ratio = (line - p50) / (p85 - p50) if (p85 - p50) > 0 else 0.5
-            return 0.50 - (ratio * 0.35)  # 50% -> 15%
+            raw_prob = 0.50 - (ratio * 0.35)  # 50% -> 15%
+
+        # Aplicar calibración isotónica si está disponible
+        if calibrate and self.probability_calibrator.is_fitted:
+            return self.probability_calibrator.calibrate(raw_prob)
+
+        return raw_prob
+
+    def get_calibrated_probability(self, raw_prob: float) -> float:
+        """
+        Calibra una probabilidad cruda usando el modelo isotónico.
+
+        Si el calibrador no está ajustado, devuelve la probabilidad original.
+        """
+        if self.probability_calibrator.is_fitted:
+            return self.probability_calibrator.calibrate(raw_prob)
+        return raw_prob
 
     def evaluate_bet(self, player_name: str, opponent: str, stat: str,
                      line: float, odds: float, is_home: bool = True,
